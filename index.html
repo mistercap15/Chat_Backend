@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Socket.IO Chat Test</title>
+</head>
+<body>
+  <h1>Socket.IO Chat Test</h1>
+
+  <div>
+    <p><strong>Your User ID:</strong> <span id="userId"></span></p>
+    <button id="searchBtn">Start Searching</button>
+  </div>
+
+  <hr>
+
+  <div id="chatSection" style="display: none;">
+    <h3>Chat</h3>
+    <div id="messages" style="border: 1px solid #000; padding: 10px; height: 200px; overflow-y: scroll;"></div>
+    <input type="text" id="messageInput" placeholder="Type a message..." />
+    <button id="sendBtn">Send</button>
+  </div>
+
+  <!-- Include Socket.IO client -->
+  <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+  <script>
+    const socket = io('http://localhost:3000'); // Connect to your server
+    const userId = 'USER_' + Math.floor(Math.random() * 10000);
+    document.getElementById('userId').innerText = userId;
+  
+    let partnerId = null;
+  
+    socket.on('connect', () => {
+      console.log('Connected to server:', socket.id);
+    });
+  
+    // Start searching
+    document.getElementById('searchBtn').addEventListener('click', () => {
+      socket.emit('start_search', { userId });
+      console.log('Started searching...');
+    });
+  
+    // Handle match found
+    socket.on('match_found', (data) => {
+      partnerId = data.partnerId;
+      console.log(`Matched with: ${partnerId}`);
+      document.getElementById('chatSection').style.display = 'block';
+    });
+  
+    // Send message
+    document.getElementById('sendBtn').addEventListener('click', () => {
+      const message = document.getElementById('messageInput').value;
+      if (partnerId && message.trim() !== '') {
+        socket.emit('send_message', { toUserId: partnerId, fromUserId: userId, message });
+        appendMessage(`You: ${message}`);
+        document.getElementById('messageInput').value = '';
+      }
+    });
+  
+    // Handle received messages
+    socket.on('receive_message', (data) => {
+      console.log(`Received message from ${data.fromUserId}: ${data.message}`);
+      
+      // Don't display your own message
+      if (data.fromUserId !== userId) {
+        appendMessage(`${data.fromUserId}: ${data.message}`);
+      }
+    });
+  
+    // Append message to the chat
+    function appendMessage(msg) {
+      const div = document.createElement('div');
+      div.innerText = msg;
+      document.getElementById('messages').appendChild(div);
+    }
+  </script>
+  
+</body>
+</html>
