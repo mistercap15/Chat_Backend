@@ -136,17 +136,6 @@ const handleSocketConnection = (socket, io) => {
     }
   });
 
-  socket.on('send_friend_request', ({ toUserId, fromUserId, fromUsername }) => {
-    log('Received send_friend_request', { toUserId, fromUserId, fromUsername });
-    if (!fromUserId || !toUserId || !/^[0-9a-fA-F]{24}$/.test(fromUserId) || !/^[0-9a-fA-F]{24}$/.test(toUserId)) {
-      log('Validation failed: Invalid user IDs', { fromUserId, toUserId });
-      socket.emit('error', { message: 'Invalid user IDs' });
-      return;
-    }
-    io.to(toUserId).emit('friend_request_received', { fromUserId, fromUsername });
-    log('Emitted friend_request_received', { toUserId, fromUserId });
-  });
-
   socket.on('typing', ({ toUserId, fromUserId }) => {
     log('Received typing', { toUserId, fromUserId });
     if (!fromUserId || !toUserId || !/^[0-9a-fA-F]{24}$/.test(fromUserId) || !/^[0-9a-fA-F]{24}$/.test(toUserId)) {
@@ -199,12 +188,19 @@ const handleSocketConnection = (socket, io) => {
     }
     const room = activeRooms.get(fromUserId);
     if (room && room.partnerId === toUserId) {
-      io.to(toUserId).emit('receive_message', { message, fromUserId, timestamp });
+      io.to(toUserId).emit('receive_message', { message, fromUserId, timestamp }); // Emit only to recipient
       if (room.type === 'random') {
         const messages = randomChatMessages.get(room.roomId) || [];
-        messages.push({ senderId: fromUserId, text: message, timestamp: new Date(timestamp), seen: false });
-        randomChatMessages.set(room.roomId, messages);
-        log('Stored random chat message', { roomId: room.roomId, messageCount: messages.length });
+        // Deduplication: Check if message with same text and sender exists within 1 second
+        const dedupeWindow = 1000;
+        const recentMessages = messages.filter((msg) => Math.abs(new Date(msg.timestamp).getTime() - timestamp) < dedupeWindow);
+        if (!recentMessages.some((msg) => msg.text === message && msg.senderId === fromUserId)) {
+          messages.push({ senderId: fromUserId, text: message, timestamp: new Date(timestamp), seen: false });
+          randomChatMessages.set(room.roomId, messages);
+          log('Stored random chat message', { roomId: room.roomId, messageCount: messages.length });
+        } else {
+          log('Ignored duplicate random chat message', { roomId: room.roomId, message, timestamp });
+        }
       }
       log('Emitted receive_message to recipient', { toUserId, fromUserId, timestamp });
     } else {
@@ -219,7 +215,6 @@ const handleSocketConnection = (socket, io) => {
       searchingUsers.delete(socket.userId);
       const room = activeRooms.get(socket.userId);
       if (room) {
-        // Delay partner_disconnected emission
         setTimeout(() => {
           let userSocket = null;
           io.sockets.sockets.forEach((s) => {
@@ -402,24 +397,7 @@ const sendRandomMessage = async (req, res) => {
       return res.status(403).json({ message: 'Not in a random chat with this user.' });
     }
 
-    const timestamp = new Date();
-    const messages = randomChatMessages.get(room.roomId) || [];
-    messages.push({ senderId: userId, text: message, timestamp, seen: false });
-    randomChatMessages.set(room.roomId, messages);
-    log('Stored random message', { roomId: room.roomId, messageCount: messages.length });
-
-    if (!req.io) {
-      log('Socket.IO instance missing', { userId, partnerId });
-      return res.status(500).json({ message: 'Socket.IO instance not available.' });
-    }
-
-    req.io.to(room.roomId).emit('receive_message', {
-      message,
-      fromUserId: userId,
-      timestamp: timestamp.getTime(),
-    });
-    log('Emitted receive_message', { roomId: room.roomId, fromUserId: userId, timestamp });
-
+    // Note: Message emission is handled by the socket 'send_message' event, so no emission here
     res.status(200).json({ message: 'Message sent.' });
   } catch (err) {
     log('Error in sendRandomMessage', { error: err.message });

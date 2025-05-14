@@ -122,7 +122,13 @@ exports.sendFriendRequest = async (req, res) => {
       fromUserId: userId,
       fromUsername: user.user_name,
     });
-    log('Emitted friend_request_received', { toUserId: friendId, fromUsername: user.user_name });
+    req.io.in(friendId).allSockets().then((sockets) => {
+      log('Emitted friend_request_received', {
+        toUserId: friendId,
+        fromUsername: user.user_name,
+        socketIds: [...sockets],
+      });
+    });
 
     res.status(200).json({ message: 'Friend request sent.' });
   } catch (err) {
@@ -168,7 +174,6 @@ exports.acceptFriendRequest = async (req, res) => {
     await friend.save();
     log('Friendship established', { userId, friendId });
 
-    // Persist random chat messages if they exist
     const roomId = [userId, friendId].sort().join('-');
     const messages = randomChatMessages.get(roomId) || [];
     if (messages.length > 0) {
@@ -285,7 +290,6 @@ exports.deleteUser = async (req, res) => {
   try {
     const { userId } = req.body;
 
-    // Validate userId
     if (!userId || !/^[0-9a-fA-F]{24}$/.test(userId)) {
       log('Validation failed: Invalid userId', { userId });
       return res.status(400).json({ message: 'Invalid userId.' });
@@ -367,6 +371,37 @@ exports.getFriends = async (req, res) => {
     res.status(200).json({ friends: user.friends });
   } catch (err) {
     log('Error in getFriends', { error: err.message });
+    res.status(500).json({ message: err.message });
+  }
+};
+
+exports.getPendingFriendRequests = async (req, res) => {
+  log('Received getPendingFriendRequests request', { params: req.params });
+  try {
+    const { userId } = req.params;
+
+    if (!userId || !/^[0-9a-fA-F]{24}$/.test(userId)) {
+      log('Validation failed: Invalid userId', { userId });
+      return res.status(400).json({ message: 'Invalid userId.' });
+    }
+
+    const user = await User.findById(userId).populate('friendRequests.fromUserId', 'user_name');
+    if (!user) {
+      log('User not found', { userId });
+      return res.status(404).json({ message: 'User not found.' });
+    }
+
+    const pendingRequests = user.friendRequests
+      .filter((req) => req.status === 'pending')
+      .map((req) => ({
+        fromUserId: req.fromUserId._id.toString(),
+        fromUsername: req.fromUserId.user_name || 'Anonymous',
+      }));
+
+    log('Pending friend requests retrieved', { userId, requestCount: pendingRequests.length });
+    res.status(200).json({ friendRequests: pendingRequests });
+  } catch (err) {
+    log('Error in getPendingFriendRequests', { error: err.message });
     res.status(500).json({ message: err.message });
   }
 };
