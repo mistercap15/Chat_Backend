@@ -270,6 +270,12 @@ exports.removeFriend = async (req, res) => {
     user.friends = user.friends.filter((id) => id.toString() !== friendId);
     friend.friends = friend.friends.filter((id) => id.toString() !== userId);
 
+    // Delete the chat collection for this user-friend pair
+    await Chat.deleteOne({
+      participants: { $all: [userId, friendId] },
+    });
+    log('Chat collection deleted', { userId, friendId });
+
     await user.save();
     await friend.save();
     log('Friendship removed', { userId, friendId });
