@@ -6,6 +6,7 @@ const log = (message, data) => {
   console.log(`[${new Date().toISOString()}] UserController: ${message}`, data || '');
 };
 
+// Existing createUser function
 exports.createUser = async (req, res) => {
   log('Received createUser request', { body: req.body });
   try {
@@ -78,6 +79,7 @@ exports.createUser = async (req, res) => {
   }
 };
 
+// Existing sendFriendRequest function
 exports.sendFriendRequest = async (req, res) => {
   log('Received sendFriendRequest request', { body: req.body });
   try {
@@ -137,6 +139,7 @@ exports.sendFriendRequest = async (req, res) => {
   }
 };
 
+// Existing acceptFriendRequest function
 exports.acceptFriendRequest = async (req, res) => {
   log('Received acceptFriendRequest request', { body: req.body });
   try {
@@ -212,6 +215,7 @@ exports.acceptFriendRequest = async (req, res) => {
   }
 };
 
+// Existing rejectFriendRequest function
 exports.rejectFriendRequest = async (req, res) => {
   log('Received rejectFriendRequest request', { body: req.body });
   try {
@@ -244,6 +248,7 @@ exports.rejectFriendRequest = async (req, res) => {
   }
 };
 
+// Existing removeFriend function
 exports.removeFriend = async (req, res) => {
   log('Received removeFriend request', { params: req.params });
   try {
@@ -291,6 +296,7 @@ exports.removeFriend = async (req, res) => {
   }
 };
 
+// Existing deleteUser function
 exports.deleteUser = async (req, res) => {
   log('Received deleteUser request', { body: req.body });
   try {
@@ -357,6 +363,7 @@ exports.deleteUser = async (req, res) => {
   }
 };
 
+// Existing getFriends function
 exports.getFriends = async (req, res) => {
   log('Received getFriends request', { params: req.params });
   try {
@@ -381,6 +388,7 @@ exports.getFriends = async (req, res) => {
   }
 };
 
+// Existing getPendingFriendRequests function
 exports.getPendingFriendRequests = async (req, res) => {
   log('Received getPendingFriendRequests request', { params: req.params });
   try {
@@ -408,6 +416,36 @@ exports.getPendingFriendRequests = async (req, res) => {
     res.status(200).json({ friendRequests: pendingRequests });
   } catch (err) {
     log('Error in getPendingFriendRequests', { error: err.message });
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// New function to get user by ID
+exports.getUserById = async (req, res) => {
+  log('Received getUserById request', { params: req.params });
+  try {
+    const { userId } = req.params;
+
+    if (!userId || !/^[0-9a-fA-F]{24}$/.test(userId)) {
+      log('Validation failed: Invalid userId', { userId });
+      return res.status(400).json({ message: 'Invalid userId.' });
+    }
+
+    const user = await User.findById(userId).select('user_name gender bio interests -_id');
+    if (!user) {
+      log('User not found', { userId });
+      return res.status(404).json({ message: 'User not found.' });
+    }
+
+    log('User retrieved', { userId });
+    res.status(200).json({
+      user_name: user.user_name,
+      gender: user.gender,
+      bio: user.bio,
+      interests: user.interests,
+    });
+  } catch (err) {
+    log('Error in getUserById', { error: err.message });
     res.status(500).json({ message: err.message });
   }
 };
