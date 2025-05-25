@@ -68,6 +68,9 @@ io.on('connection', (socket) => {
   handleSocketConnection(socket, io);
 });
 
+app.get('/', (req, res) => {
+  res.send('OK');
+});
 // Connect to MongoDB
 connectDB()
   .then(() => {

@@ -209,6 +209,45 @@ const handleSocketConnection = (socket, io) => {
     }
   });
 
+  socket.on('friend_request_sent', ({ toUserId, fromUserId, fromUsername }) => {
+    log('Received friend_request_sent', { toUserId, fromUserId, fromUsername });
+    if (!fromUserId || !toUserId || !/^[0-9a-fA-F]{24}$/.test(fromUserId) || !/^[0-9a-fA-F]{24}$/.test(toUserId)) {
+      log('Validation failed: Invalid user IDs', { fromUserId, toUserId });
+      return;
+    }
+    const room = activeRooms.get(fromUserId);
+    if (room && room.type === 'random' && room.partnerId === toUserId) {
+      io.to(room.roomId).emit('friend_request_status', { fromUserId, toUserId, fromUsername, status: 'sent' });
+      log('Emitted friend_request_status', { roomId: room.roomId, fromUserId, toUserId });
+    }
+  });
+
+  socket.on('friend_request_accepted', ({ userId, friendId }) => {
+    log('Received friend_request_accepted', { userId, friendId });
+    if (!userId || !friendId || !/^[0-9a-fA-F]{24}$/.test(userId) || !/^[0-9a-fA-F]{24}$/.test(friendId)) {
+      log('Validation failed: Invalid user IDs', { userId, friendId });
+      return;
+    }
+    const room = activeRooms.get(userId);
+    if (room && room.type === 'random' && room.partnerId === friendId) {
+      io.to(room.roomId).emit('friend_request_accepted', { userId, friendId });
+      log('Emitted friend_request_accepted', { roomId: room.roomId, userId, friendId });
+    }
+  });
+
+  socket.on('friend_request_rejected', ({ userId, friendId }) => {
+    log('Received friend_request_rejected', { userId, friendId });
+    if (!userId || !friendId || !/^[0-9a-fA-F]{24}$/.test(userId) || !/^[0-9a-fA-F]{24}$/.test(friendId)) {
+      log('Validation failed: Invalid user IDs', { userId, friendId });
+      return;
+    }
+    const room = activeRooms.get(userId);
+    if (room && room.type === 'random' && room.partnerId === friendId) {
+      io.to(room.roomId).emit('friend_request_status', { fromUserId: friendId, toUserId: userId, status: 'rejected' });
+      log('Emitted friend_request_status (rejected)', { roomId: room.roomId, userId, friendId });
+    }
+  });
+
   socket.on('disconnect', () => {
     if (socket.userId) {
       log('User disconnected', { userId: socket.userId });
