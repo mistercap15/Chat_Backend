@@ -6,7 +6,7 @@ const log = (message, data) => {
   console.log(`[${new Date().toISOString()}] UserController: ${message}`, data || '');
 };
 
-// Create or update user (existing function, included for completeness)
+// Create or update user (unchanged, included for completeness)
 exports.createUser = async (req, res) => {
   log('Received createUser request', { body: req.body });
   try {
@@ -79,7 +79,7 @@ exports.createUser = async (req, res) => {
   }
 };
 
-// New updateUser function for POST /api/users/update
+// Update user (unchanged, included for completeness)
 exports.updateUser = async (req, res) => {
   log('Received updateUser request', { body: req.body });
   try {
@@ -137,7 +137,7 @@ exports.updateUser = async (req, res) => {
   }
 };
 
-// Send friend request (unchanged, included for completeness)
+// Send friend request (unchanged)
 exports.sendFriendRequest = async (req, res) => {
   log('Received sendFriendRequest request', { body: req.body });
   try {
@@ -212,7 +212,7 @@ exports.sendFriendRequest = async (req, res) => {
   }
 };
 
-// Accept friend request (unchanged, included for completeness)
+// Accept friend request (unchanged)
 exports.acceptFriendRequest = async (req, res) => {
   log('Received acceptFriendRequest request', { body: req.body });
   try {
@@ -300,7 +300,7 @@ exports.acceptFriendRequest = async (req, res) => {
   }
 };
 
-// Reject friend request (unchanged)
+// Reject friend request (updated)
 exports.rejectFriendRequest = async (req, res) => {
   log('Received rejectFriendRequest request', { body: req.body });
   try {
@@ -312,9 +312,10 @@ exports.rejectFriendRequest = async (req, res) => {
     }
 
     const user = await User.findById(userId);
-    if (!user) {
-      log('User not found', { userId });
-      return res.status(404).json({ message: 'User not found.' });
+    const friend = await User.findById(friendId);
+    if (!user || !friend) {
+      log('User or friend not found', { userId, friendId });
+      return res.status(404).json({ message: 'User or friend not found.' });
     }
 
     if (!user.friendRequests.some((req) => req.fromUserId.toString() === friendId)) {
@@ -322,14 +323,20 @@ exports.rejectFriendRequest = async (req, res) => {
       return res.status(400).json({ message: 'No pending friend request.' });
     }
 
+    // Remove the friend request from the recipient's friendRequests
     user.friendRequests = user.friendRequests.filter((req) => req.fromUserId.toString() !== friendId);
+
+    // Remove any pending friend request from the sender to the recipient
+    friend.friendRequests = friend.friendRequests.filter((req) => req.fromUserId.toString() !== userId);
+
     await user.save();
-    log('Friend request rejected', { userId, friendId });
+    await friend.save();
+    log('Friend request rejected and cleared for both users', { userId, friendId });
 
     const room = activeRooms.get(userId);
     if (room && room.type === 'random' && room.partnerId === friendId) {
-      req.io.to(userId).emit('friend_request_rejected', { userId, friendId });
-      req.io.to(friendId).emit('friend_request_rejected', { userId, friendId });
+      req.io.to(userId).emit('friend_request_rejected', { fromUserId: friendId, toUserId: userId });
+      req.io.to(friendId).emit('friend_request_rejected', { fromUserId: friendId, toUserId: userId });
       log('Emitted friend_request_rejected to both users', { userId, friendId });
     }
 
