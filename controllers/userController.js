@@ -6,7 +6,7 @@ const log = (message, data) => {
   console.log(`[${new Date().toISOString()}] UserController: ${message}`, data || '');
 };
 
-// Existing createUser function
+// Create or update user (existing function, included for completeness)
 exports.createUser = async (req, res) => {
   log('Received createUser request', { body: req.body });
   try {
@@ -79,7 +79,65 @@ exports.createUser = async (req, res) => {
   }
 };
 
-// Updated sendFriendRequest function
+// New updateUser function for POST /api/users/update
+exports.updateUser = async (req, res) => {
+  log('Received updateUser request', { body: req.body });
+  try {
+    const { user_name, gender, bio, interests, userId } = req.body;
+
+    if (!userId || !/^[0-9a-fA-F]{24}$/.test(userId)) {
+      log('Validation failed: Invalid userId', { userId });
+      return res.status(400).json({ message: 'Invalid userId.' });
+    }
+
+    if (!user_name || !gender) {
+      log('Validation failed: Missing required fields', { user_name, gender });
+      return res.status(400).json({ message: 'Username and gender are required.' });
+    }
+
+    if (!['Male', 'Female', 'Unknown'].includes(gender)) {
+      log('Validation failed: Invalid gender', { gender });
+      return res.status(400).json({ message: 'Invalid gender.' });
+    }
+
+    const user = await User.findById(userId);
+    if (!user) {
+      log('User not found', { userId });
+      return res.status(404).json({ message: 'User not found.' });
+    }
+
+    const existingUser = await User.findOne({ user_name, _id: { $ne: userId } });
+    if (existingUser) {
+      log('Username already in use', { user_name });
+      return res.status(400).json({ message: 'Username already in use.' });
+    }
+
+    user.user_name = user_name.trim();
+    user.gender = gender;
+    user.bio = bio ? bio.trim() : '';
+    user.interests = interests || [];
+
+    await user.save();
+    log('User updated successfully', { userId, user_name });
+
+    res.status(200).json({
+      message: 'User updated successfully.',
+      user: {
+        _id: user._id,
+        user_name: user.user_name,
+        gender: user.gender,
+        bio: user.bio,
+        interests: user.interests,
+        friends: user.friends,
+      },
+    });
+  } catch (err) {
+    log('Error in updateUser', { error: err.message });
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// Send friend request (unchanged, included for completeness)
 exports.sendFriendRequest = async (req, res) => {
   log('Received sendFriendRequest request', { body: req.body });
   try {
@@ -120,7 +178,6 @@ exports.sendFriendRequest = async (req, res) => {
     await friend.save();
     log('Friend request saved', { fromUserId: userId, toUserId: friendId });
 
-    // Emit friend_request_received to the recipient
     req.io.to(friendId).emit('friend_request_received', {
       fromUserId: userId,
       fromUsername: user.user_name,
@@ -133,7 +190,6 @@ exports.sendFriendRequest = async (req, res) => {
       });
     });
 
-    // Emit friend_request_sent to both users if they are in a random chat
     const room = activeRooms.get(userId);
     if (room && room.type === 'random' && room.partnerId === friendId) {
       req.io.to(userId).emit('friend_request_sent', {
@@ -156,7 +212,7 @@ exports.sendFriendRequest = async (req, res) => {
   }
 };
 
-// Updated acceptFriendRequest function
+// Accept friend request (unchanged, included for completeness)
 exports.acceptFriendRequest = async (req, res) => {
   log('Received acceptFriendRequest request', { body: req.body });
   try {
@@ -215,7 +271,6 @@ exports.acceptFriendRequest = async (req, res) => {
     activeRooms.delete(friendId);
     log('Cleared active rooms', { userId, friendId });
 
-    // Emit friend_request_accepted to both users
     req.io.to(userId).emit('friend_request_accepted', {
       userId,
       friendId,
@@ -228,7 +283,6 @@ exports.acceptFriendRequest = async (req, res) => {
     });
     log('Emitted friend_request_accepted', { userId, friendId });
 
-    // Emit friend_added to both users to refresh friends list
     req.io.to(userId).emit('friend_added', {
       friendId,
       friendUsername: friend.user_name,
@@ -246,7 +300,7 @@ exports.acceptFriendRequest = async (req, res) => {
   }
 };
 
-// Updated rejectFriendRequest function
+// Reject friend request (unchanged)
 exports.rejectFriendRequest = async (req, res) => {
   log('Received rejectFriendRequest request', { body: req.body });
   try {
@@ -272,7 +326,6 @@ exports.rejectFriendRequest = async (req, res) => {
     await user.save();
     log('Friend request rejected', { userId, friendId });
 
-    // Emit friend_request_rejected to both users if they are in a random chat
     const room = activeRooms.get(userId);
     if (room && room.type === 'random' && room.partnerId === friendId) {
       req.io.to(userId).emit('friend_request_rejected', { userId, friendId });
@@ -287,7 +340,7 @@ exports.rejectFriendRequest = async (req, res) => {
   }
 };
 
-// Existing removeFriend function
+// Remove friend (unchanged)
 exports.removeFriend = async (req, res) => {
   log('Received removeFriend request', { params: req.params });
   try {
@@ -314,7 +367,6 @@ exports.removeFriend = async (req, res) => {
     user.friends = user.friends.filter((id) => id.toString() !== friendId);
     friend.friends = friend.friends.filter((id) => id.toString() !== userId);
 
-    // Delete the chat collection for this user-friend pair
     await Chat.deleteOne({
       participants: { $all: [userId, friendId] },
     });
@@ -335,7 +387,7 @@ exports.removeFriend = async (req, res) => {
   }
 };
 
-// Existing deleteUser function
+// Delete user (unchanged)
 exports.deleteUser = async (req, res) => {
   log('Received deleteUser request', { body: req.body });
   try {
@@ -402,7 +454,7 @@ exports.deleteUser = async (req, res) => {
   }
 };
 
-// Existing getFriends function
+// Get friends (unchanged)
 exports.getFriends = async (req, res) => {
   log('Received getFriends request', { params: req.params });
   try {
@@ -427,7 +479,7 @@ exports.getFriends = async (req, res) => {
   }
 };
 
-// Existing getPendingFriendRequests function
+// Get pending friend requests (unchanged)
 exports.getPendingFriendRequests = async (req, res) => {
   log('Received getPendingFriendRequests request', { params: req.params });
   try {
@@ -459,7 +511,7 @@ exports.getPendingFriendRequests = async (req, res) => {
   }
 };
 
-// Existing getUserById function
+// Get user by ID (unchanged)
 exports.getUserById = async (req, res) => {
   log('Received getUserById request', { params: req.params });
   try {
