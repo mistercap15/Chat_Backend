@@ -1,6 +1,5 @@
 require('dotenv').config();
-const mongoose = require('mongoose');
-const connectDB = require('../config/db');
+const { connectDB } = require('../config/db');
 const Interest = require('../models/Interest');
 
 const interests = [
@@ -12,11 +11,16 @@ const interests = [
 ];
 
 const seedInterests = async () => {
-  await connectDB();
-  await Interest.deleteMany();
-  await Interest.insertMany(interests);
-  console.log('Interests Seeded ✅');
-  process.exit();
+  try {
+    await connectDB();
+    await Interest.deleteMany({});
+    await Interest.insertMany(interests);
+    console.log('Interests seeded ✅');
+    process.exit(0);
+  } catch (error) {
+    console.error('Interest seeding failed:', error.message);
+    process.exit(1);
+  }
 };
 
 seedInterests();
