@@ -3,91 +3,204 @@ const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
 const cors = require('cors');
+const helmet = require('helmet');
+const morgan = require('morgan');
+const jwt = require('jsonwebtoken');
 const mongoose = require('mongoose');
+
+const logger = require('./utils/logger');
+const { connectDB } = require('./config/db');
+const { generalLimiter } = require('./middlewares/rateLimit');
+
 const userRoutes = require('./routes/user');
 const chatRoutes = require('./routes/chat');
+const authRoutes = require('./routes/auth');
+const adminRoutes = require('./routes/admin');
 const { handleSocketConnection } = require('./controllers/chatController');
-const { connectDB } = require('./config/db');
+
+// ─── App & Server Setup ───────────────────────────────────────────────────────
 
 const app = express();
 const server = http.createServer(app);
+
+const allowedOrigins = process.env.FRONTEND_URL
+  ? process.env.FRONTEND_URL.split(',').map((o) => o.trim())
+  : '*';
+
 const io = socketIo(server, {
   cors: {
-    origin: process.env.FRONTEND_URL || '*',
+    origin: allowedOrigins,
     methods: ['GET', 'POST'],
+    credentials: true,
   },
+  pingTimeout: 60000,
+  pingInterval: 25000,
 });
 
-const log = (message, data) => {
-  console.log(`[${new Date().toISOString()}] Server: ${message}`, data || '');
-};
+// ─── Socket.IO: JWT Authentication ───────────────────────────────────────────
 
-// Rate limiting for socket events
-const rateLimit = new Map();
-const RATE_LIMIT_WINDOW = 1000; // 1 second
-const MAX_EVENTS = 10; // Max 10 events per second per socket
 io.use((socket, next) => {
-  const socketId = socket.id;
-  const now = Date.now();
-  const events = rateLimit.get(socketId) || [];
-
-  // Remove old events
-  rateLimit.set(socketId, events.filter((t) => now - t < RATE_LIMIT_WINDOW));
-
-  if (events.length >= MAX_EVENTS) {
-    log(`Rate limit exceeded for socket ${socketId}`);
-    return next(new Error('Rate limit exceeded'));
+  const token = socket.handshake.auth?.token;
+  if (!token) {
+    return next(new Error('Authentication required. Provide a token in socket.handshake.auth.token'));
   }
-
-  events.push(now);
-  rateLimit.set(socketId, events);
-  next();
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    socket.userId = decoded.userId;
+    next();
+  } catch (err) {
+    logger.warn('Socket JWT verification failed', { error: err.message });
+    next(new Error('Invalid or expired token.'));
+  }
 });
 
-app.use(cors());
-app.use(express.json());
+// ─── Socket.IO: Per-Event Rate Limiting ──────────────────────────────────────
 
-// Middleware to attach io to req
-app.use((req, res, next) => {
-  log(`${req.method} ${req.path}`, { body: req.body, params: req.params });
-  req.io = io;
-  if (!req.io) {
-    log('Socket.IO instance not attached to req');
-    return res.status(500).json({ message: 'Socket.IO instance not available' });
-  }
-  next();
-});
+const SOCKET_RATE_WINDOW = 1000; // ms
+const SOCKET_MAX_EVENTS = 15;    // events per window per socket
 
-// Routes
-app.use('/api/users', userRoutes);
-app.use('/api/chats', chatRoutes);
-
-// Socket.IO connection
 io.on('connection', (socket) => {
-  log('New socket connection', { socketId: socket.id });
+  logger.info('Socket connected', { socketId: socket.id, userId: socket.userId });
+
+  const eventTimestamps = new Map();
+
+  socket.use(([event], next) => {
+    const now = Date.now();
+    const timestamps = (eventTimestamps.get(event) || []).filter(
+      (t) => now - t < SOCKET_RATE_WINDOW
+    );
+
+    if (timestamps.length >= SOCKET_MAX_EVENTS) {
+      logger.warn('Socket rate limit exceeded', { userId: socket.userId, event });
+      return next(new Error(`Rate limit exceeded for event: ${event}`));
+    }
+
+    timestamps.push(now);
+    eventTimestamps.set(event, timestamps);
+    next();
+  });
+
   handleSocketConnection(socket, io);
 });
 
-app.get('/', (req, res) => {
-  res.send('OK');
-});
-// Connect to MongoDB
-connectDB()
-  .then(() => {
-    log('MongoDB connected successfully');
+// ─── HTTP Middleware ──────────────────────────────────────────────────────────
+
+app.use(helmet());
+app.use(
+  cors({
+    origin: allowedOrigins,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-key'],
+    credentials: true,
   })
-  .catch((err) => {
-    log('MongoDB connection error', { error: err.message });
-    process.exit(1); // Exit process on DB connection failure
+);
+app.use(morgan('combined', {
+  stream: { write: (msg) => logger.info(msg.trim()) },
+}));
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: true, limit: '1mb' }));
+app.use(generalLimiter);
+
+// Serve uploaded files
+app.use('/uploads', express.static('uploads'));
+
+// Attach Socket.IO instance to every request
+app.use((req, _res, next) => {
+  req.io = io;
+  next();
+});
+
+// ─── Routes ───────────────────────────────────────────────────────────────────
+
+app.use('/api/auth', authRoutes);
+app.use('/api/users', userRoutes);
+app.use('/api/chats', chatRoutes);
+app.use('/api/admin', adminRoutes);
+
+// ─── Health Check ─────────────────────────────────────────────────────────────
+
+app.get('/health', (_req, res) => {
+  const dbState = mongoose.connection.readyState;
+  const dbStatus = ['disconnected', 'connected', 'connecting', 'disconnecting'][dbState] || 'unknown';
+  const status = dbState === 1 ? 'ok' : 'degraded';
+  res.status(dbState === 1 ? 200 : 503).json({
+    status,
+    db: dbStatus,
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString(),
+  });
+});
+
+app.get('/', (_req, res) => res.json({ message: 'Chat API is running.' }));
+
+// ─── 404 Handler ──────────────────────────────────────────────────────────────
+
+app.use((req, res) => {
+  res.status(404).json({ message: `Route ${req.method} ${req.path} not found.` });
+});
+
+// ─── Global Error Handler ─────────────────────────────────────────────────────
+
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, _next) => {
+  // Handle multer errors
+  if (err.code === 'LIMIT_FILE_SIZE') {
+    return res.status(400).json({ message: 'File too large. Maximum size is 5 MB.' });
+  }
+  if (err.message && err.message.includes('Only JPEG')) {
+    return res.status(400).json({ message: err.message });
+  }
+
+  logger.error('Unhandled server error', { error: err.message, stack: err.stack, path: req.path });
+  res.status(err.status || 500).json({ message: err.expose ? err.message : 'Internal server error.' });
+});
+
+// ─── Graceful Shutdown ────────────────────────────────────────────────────────
+
+const gracefulShutdown = (signal) => {
+  logger.info(`Received ${signal}. Shutting down gracefully...`);
+
+  server.close(async () => {
+    logger.info('HTTP server closed.');
+    try {
+      await mongoose.connection.close();
+      logger.info('MongoDB connection closed.');
+    } catch (err) {
+      logger.error('Error closing MongoDB', { error: err.message });
+    }
+    process.exit(0);
   });
 
-// Global error handler
-app.use((err, req, res, next) => {
-  log('Server error', { error: err.message, stack: err.stack });
-  res.status(500).json({ message: 'Internal server error' });
+  // Force exit if shutdown takes too long
+  setTimeout(() => {
+    logger.error('Graceful shutdown timed out. Forcing exit.');
+    process.exit(1);
+  }, 15000);
+};
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+process.on('uncaughtException', (err) => {
+  logger.error('Uncaught exception', { error: err.message, stack: err.stack });
+  gracefulShutdown('uncaughtException');
 });
 
-const PORT = process.env.PORT || 5000;
-server.listen(PORT, '0.0.0.0', () => {
-  log(`Server running on http://0.0.0.0:${PORT}`);
+process.on('unhandledRejection', (reason) => {
+  logger.error('Unhandled promise rejection', { reason: String(reason) });
 });
+
+// ─── Start: DB first, then listen ────────────────────────────────────────────
+
+const PORT = process.env.PORT || 5000;
+
+connectDB()
+  .then(() => {
+    server.listen(PORT, '0.0.0.0', () => {
+      logger.info(`Server running on http://0.0.0.0:${PORT}`);
+    });
+  })
+  .catch((err) => {
+    logger.error('Failed to connect to MongoDB, aborting startup', { error: err.message });
+    process.exit(1);
+  });

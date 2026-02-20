@@ -1,82 +1,85 @@
-// server/controllers/ChatController.js
+const jwt = require('jsonwebtoken');
 const User = require('../models/User');
 const Chat = require('../models/Chat');
 const { activeRooms, randomChatMessages } = require('../utils/activeRooms');
+const logger = require('../utils/logger');
 
 const searchingUsers = new Set();
-const DISCONNECT_GRACE_PERIOD = 60000;
+const DISCONNECT_GRACE_PERIOD = 60000; // 60 seconds
+const OBJECT_ID_RE = /^[0-9a-fA-F]{24}$/;
 
-const log = (message, data) => {
-  console.log(`[${new Date().toISOString()}] ChatController: ${message}`, data || '');
-};
+// ─── Socket.IO Connection Handler ─────────────────────────────────────────────
 
 const handleSocketConnection = (socket, io) => {
-  log('User connected', { socketId: socket.id });
+  logger.info('Socket connected', { socketId: socket.id, userId: socket.userId });
 
-  socket.on('set_username', async ({ userId, username }) => {
-    if (!userId || !/^[0-9a-fA-F]{24}$/.test(userId)) {
-      socket.emit('error', { message: 'Invalid userId' });
-      return;
-    }
-    socket.userId = userId;
-    socket.username = username || 'Anonymous';
-    socket.join(userId);
-    log('Username set', { userId, username: socket.username });
+  // Immediately join the user's personal room for direct events
+  if (socket.userId) {
+    socket.join(socket.userId);
 
-    const room = activeRooms.get(userId);
-    if (room) {
-      socket.join(room.roomId);
-      log('User rejoined room', { userId, roomId: room.roomId, partnerId: room.partnerId });
+    const existingRoom = activeRooms.get(socket.userId);
+    if (existingRoom) {
+      socket.join(existingRoom.roomId);
+      logger.info('User rejoined active room on reconnect', {
+        userId: socket.userId,
+        roomId: existingRoom.roomId,
+      });
     }
-  });
+  }
 
-  socket.on('start_search', async ({ userId, username }) => {
-    if (!userId || !/^[0-9a-fA-F]{24}$/.test(userId)) {
-      socket.emit('error', { message: 'Invalid userId' });
-      return;
-    }
+  // ── start_search ─────────────────────────────────────────────────────────────
+  socket.on('start_search', async () => {
+    const userId = socket.userId;
 
     if (searchingUsers.has(userId) || activeRooms.has(userId)) {
-      socket.emit('error', { message: 'Already in a search or chat' });
+      socket.emit('error', { message: 'Already in a search or chat.' });
       return;
     }
 
     try {
       const user = await User.findById(userId).select('user_name friends');
       if (!user) {
-        socket.emit('error', { message: 'User not found' });
+        socket.emit('error', { message: 'User not found.' });
         return;
       }
-
-      socket.userId = userId;
-      socket.username = user.user_name || username || 'Anonymous';
+      socket.username = user.user_name;
       searchingUsers.add(userId);
+      logger.info('User started searching', { userId });
       await tryMatchUser(userId, socket, io);
-    } catch (error) {
+    } catch (err) {
       searchingUsers.delete(userId);
-      socket.emit('error', { message: 'Server error during search' });
+      logger.error('Error in start_search', { userId, error: err.message });
+      socket.emit('error', { message: 'Server error during search.' });
     }
   });
 
-  socket.on('stop_search', ({ userId }) => {
-    if (!userId || !/^[0-9a-fA-F]{24}$/.test(userId)) {
-      return;
-    }
-    searchingUsers.delete(userId);
-    log('User removed from searching', { userId });
+  // ── stop_search ───────────────────────────────────────────────────────────────
+  socket.on('stop_search', () => {
+    searchingUsers.delete(socket.userId);
+    logger.info('User stopped searching', { userId: socket.userId });
   });
 
-  socket.on('start_friend_chat', async ({ userId, friendId, username }) => {
-    if (!userId || !friendId || !/^[0-9a-fA-F]{24}$/.test(userId) || !/^[0-9a-fA-F]{24}$/.test(friendId)) {
-      socket.emit('error', { message: 'Invalid userId or friendId' });
+  // ── start_friend_chat ─────────────────────────────────────────────────────────
+  socket.on('start_friend_chat', async ({ friendId }) => {
+    const userId = socket.userId;
+
+    if (!friendId || !OBJECT_ID_RE.test(friendId)) {
+      socket.emit('error', { message: 'Invalid friendId.' });
       return;
     }
 
     try {
-      const user = await User.findById(userId).select('user_name friends');
-      const friend = await User.findById(friendId).select('user_name');
-      if (!friend || !user || !user.friends.includes(friendId)) {
-        socket.emit('error', { message: 'User or friend not found or not friends' });
+      const [user, friend] = await Promise.all([
+        User.findById(userId).select('user_name friends'),
+        User.findById(friendId).select('user_name'),
+      ]);
+
+      if (!user || !friend) {
+        socket.emit('error', { message: 'User or friend not found.' });
+        return;
+      }
+      if (!user.friends.some((id) => id.toString() === friendId)) {
+        socket.emit('error', { message: 'You are not friends with this user.' });
         return;
       }
 
@@ -84,127 +87,155 @@ const handleSocketConnection = (socket, io) => {
       activeRooms.set(userId, { roomId, type: 'friend', partnerId: friendId });
       socket.join(roomId);
       io.to(friendId).socketsJoin(roomId);
-      log('Friend chat started', { userId, friendId, roomId });
 
-      const chat = await Chat.findOne({
-        participants: { $all: [userId, friendId] },
-      });
+      const chat = await Chat.findOne({ participants: { $all: [userId, friendId] } });
 
-      io.to(userId).emit('friend_chat_started', {
-        partnerId: friendId,
-        partnerName: friend.user_name,
-      });
-      io.to(friendId).emit('friend_chat_started', {
-        partnerId: userId,
-        partnerName: user.user_name,
-      });
+      io.to(userId).emit('friend_chat_started', { partnerId: friendId, partnerName: friend.user_name });
+      io.to(friendId).emit('friend_chat_started', { partnerId: userId, partnerName: user.user_name });
       io.to(roomId).emit('chat_history', { messages: chat ? chat.messages : [] });
-    } catch (error) {
-      socket.emit('error', { message: 'Server error starting friend chat' });
+
+      logger.info('Friend chat started', { userId, friendId, roomId });
+    } catch (err) {
+      logger.error('Error in start_friend_chat', { userId, error: err.message });
+      socket.emit('error', { message: 'Server error starting friend chat.' });
     }
   });
 
-  socket.on('leave_friend_chat', ({ userId, friendId }) => {
-    if (!userId || !friendId || !/^[0-9a-fA-F]{24}$/.test(userId) || !/^[0-9a-fA-F]{24}$/.test(friendId)) {
-      return;
-    }
+  // ── leave_friend_chat ─────────────────────────────────────────────────────────
+  socket.on('leave_friend_chat', ({ friendId }) => {
+    const userId = socket.userId;
+
+    if (!friendId || !OBJECT_ID_RE.test(friendId)) return;
+
     const room = activeRooms.get(userId);
     if (room && room.type === 'friend' && room.partnerId === friendId) {
       socket.leave(room.roomId);
       activeRooms.delete(userId);
-      io.to(friendId).emit('partner_disconnected', { disconnectedUserId: userId });
-      log('User left friend chat', { userId, friendId, roomId: room.roomId });
+      io.to(friendId).emit('partner_left', { userId });
+      logger.info('User left friend chat', { userId, friendId });
     }
   });
 
+  // ── leave_chat (random) ───────────────────────────────────────────────────────
   socket.on('leave_chat', ({ toUserId }) => {
-    if (!socket.userId || !toUserId || !/^[0-9a-fA-F]{24}$/.test(socket.userId) || !/^[0-9a-fA-F]{24}$/.test(toUserId)) {
-      return;
-    }
-    const room = activeRooms.get(socket.userId);
+    const userId = socket.userId;
+
+    if (!toUserId || !OBJECT_ID_RE.test(toUserId)) return;
+
+    const room = activeRooms.get(userId);
     if (room && room.type === 'random' && room.partnerId === toUserId) {
-      log('Processing leave_chat', { userId: socket.userId, toUserId, roomId: room.roomId });
-      io.to(room.roomId).emit('partner_disconnected', { disconnectedUserId: socket.userId });
+      io.to(room.roomId).emit('partner_disconnected', { disconnectedUserId: userId });
       socket.leave(room.roomId);
-      activeRooms.delete(socket.userId);
+      activeRooms.delete(userId);
       activeRooms.delete(toUserId);
       randomChatMessages.delete(room.roomId);
-      log('User left random chat', { userId: socket.userId, toUserId, roomId: room.roomId });
-    } else {
-      log('Invalid leave_chat attempt', { userId: socket.userId, toUserId, room });
+      logger.info('User left random chat', { userId, toUserId, roomId: room.roomId });
     }
   });
 
-  socket.on('join_room', ({ roomId, userId }) => {
-    if (!userId || !roomId || !/^[0-9a-fA-F]{24}$/.test(userId)) {
-      return;
-    }
-    socket.join(roomId);
-    log('User joined room', { userId, roomId });
-  });
+  // ── typing ────────────────────────────────────────────────────────────────────
+  socket.on('typing', ({ toUserId }) => {
+    const userId = socket.userId;
 
-  socket.on('typing', ({ toUserId, fromUserId }) => {
-    if (!fromUserId || !toUserId || !/^[0-9a-fA-F]{24}$/.test(fromUserId) || !/^[0-9a-fA-F]{24}$/.test(toUserId)) {
-      return;
-    }
-    const room = activeRooms.get(fromUserId);
+    if (!toUserId || !OBJECT_ID_RE.test(toUserId)) return;
+
+    const room = activeRooms.get(userId);
     if (room && room.partnerId === toUserId) {
-      io.to(room.roomId).emit('partner_typing', { fromUserId });
-      log('Typing event relayed', { fromUserId, toUserId, roomId: room.roomId });
+      io.to(room.roomId).emit('partner_typing', { fromUserId: userId });
     }
   });
 
-  socket.on('message_seen', ({ toUserId, fromUserId, timestamp }) => {
-    if (!fromUserId || !toUserId || !timestamp || !/^[0-9a-fA-F]{24}$/.test(fromUserId) || !/^[0-9a-fA-F]{24}$/.test(toUserId)) {
-      return;
-    }
-    const room = activeRooms.get(fromUserId);
+  // ── stop_typing ───────────────────────────────────────────────────────────────
+  socket.on('stop_typing', ({ toUserId }) => {
+    const userId = socket.userId;
+
+    if (!toUserId || !OBJECT_ID_RE.test(toUserId)) return;
+
+    const room = activeRooms.get(userId);
     if (room && room.partnerId === toUserId) {
-      io.to(room.roomId).emit('message_seen', { fromUserId, timestamp });
-      log('Message seen event relayed', { fromUserId, toUserId, timestamp, roomId: room.roomId });
+      io.to(room.roomId).emit('partner_stop_typing', { fromUserId: userId });
     }
   });
 
-  socket.on('send_message', ({ toUserId, message, fromUserId, timestamp }) => {
-    if (!fromUserId || !toUserId || !message || !timestamp || !/^[0-9a-fA-F]{24}$/.test(fromUserId) || !/^[0-9a-fA-F]{24}$/.test(toUserId)) {
-      socket.emit('error', { message: 'Invalid message data' });
+  // ── message_seen ──────────────────────────────────────────────────────────────
+  socket.on('message_seen', ({ toUserId, timestamp }) => {
+    const userId = socket.userId;
+
+    if (!toUserId || !timestamp || !OBJECT_ID_RE.test(toUserId)) return;
+
+    const room = activeRooms.get(userId);
+    if (room && room.partnerId === toUserId) {
+      io.to(room.roomId).emit('message_seen', { fromUserId: userId, timestamp });
+    }
+  });
+
+  // ── send_message ──────────────────────────────────────────────────────────────
+  socket.on('send_message', ({ toUserId, message, timestamp }) => {
+    const userId = socket.userId;
+
+    if (!toUserId || !message || !OBJECT_ID_RE.test(toUserId)) {
+      socket.emit('error', { message: 'Invalid message payload.' });
       return;
     }
-    const room = activeRooms.get(fromUserId);
-    if (room && room.partnerId === toUserId) {
-      log('Relaying message', { fromUserId, toUserId, message, timestamp, roomId: room.roomId });
-      io.to(room.roomId).emit('receive_message', { message, fromUserId, timestamp });
-      if (room.type === 'random') {
-        const messages = randomChatMessages.get(room.roomId) || [];
-        const dedupeWindow = 1000;
-        const recentMessages = messages.filter((msg) => Math.abs(new Date(msg.timestamp).getTime() - timestamp) < dedupeWindow);
-        if (!recentMessages.some((msg) => msg.text === message && msg.senderId === fromUserId)) {
-          messages.push({ senderId: fromUserId, text: message, timestamp: new Date(timestamp), seen: false });
-          randomChatMessages.set(room.roomId, messages);
-        }
+    if (typeof message !== 'string' || message.trim().length === 0 || message.length > 2000) {
+      socket.emit('error', { message: 'Message must be 1–2000 characters.' });
+      return;
+    }
+
+    const room = activeRooms.get(userId);
+    if (!room || room.partnerId !== toUserId) {
+      socket.emit('error', { message: 'Not in a valid chat room with this user.' });
+      return;
+    }
+
+    const ts = timestamp || Date.now();
+    io.to(room.roomId).emit('receive_message', {
+      message: message.trim(),
+      fromUserId: userId,
+      timestamp: ts,
+    });
+
+    // Buffer random chat messages for later persistence on friend request accept
+    if (room.type === 'random') {
+      const messages = randomChatMessages.get(room.roomId) || [];
+      const dedupWindow = 1000;
+      const isDupe = messages.some(
+        (m) =>
+          m.text === message.trim() &&
+          m.senderId === userId &&
+          Math.abs(new Date(m.timestamp).getTime() - ts) < dedupWindow
+      );
+      if (!isDupe) {
+        messages.push({ senderId: userId, text: message.trim(), timestamp: new Date(ts), seen: false });
+        randomChatMessages.set(room.roomId, messages);
       }
-    } else {
-      log('Message not relayed', { fromUserId, toUserId, reason: 'Invalid room or partner', room });
-      socket.emit('error', { message: 'Not in a valid chat room' });
     }
   });
 
-  socket.on('friend_request_sent', ({ toUserId, fromUserId, fromUsername }) => {
-    if (!fromUserId || !toUserId || !/^[0-9a-fA-F]{24}$/.test(fromUserId) || !/^[0-9a-fA-F]{24}$/.test(toUserId)) {
-      return;
-    }
-    const room = activeRooms.get(fromUserId);
+  // ── friend_request_sent (socket notification) ─────────────────────────────────
+  socket.on('friend_request_sent', ({ toUserId, fromUsername }) => {
+    const userId = socket.userId;
+
+    if (!toUserId || !OBJECT_ID_RE.test(toUserId)) return;
+
+    const room = activeRooms.get(userId);
     if (room && room.type === 'random' && room.partnerId === toUserId) {
-      io.to(room.roomId).emit('friend_request_status', { fromUserId, toUserId, fromUsername, status: 'sent' });
-      io.to(toUserId).emit('friend_request_received', { fromUserId, fromUsername });
-      log('Friend request sent', { fromUserId, toUserId, roomId: room.roomId });
+      io.to(room.roomId).emit('friend_request_status', {
+        fromUserId: userId,
+        toUserId,
+        fromUsername,
+        status: 'sent',
+      });
+      io.to(toUserId).emit('friend_request_received', { fromUserId: userId, fromUsername });
     }
   });
 
-  socket.on('friend_request_accepted', async ({ userId, friendId }) => {
-    if (!userId || !friendId || !/^[0-9a-fA-F]{24}$/.test(userId) || !/^[0-9a-fA-F]{24}$/.test(friendId)) {
-      return;
-    }
+  // ── friend_request_accepted (socket notification) ─────────────────────────────
+  socket.on('friend_request_accepted', async ({ friendId }) => {
+    const userId = socket.userId;
+
+    if (!friendId || !OBJECT_ID_RE.test(friendId)) return;
+
     const room = activeRooms.get(userId);
     if (room && room.type === 'random' && room.partnerId === friendId) {
       io.to(room.roomId).emit('friend_request_accepted', { userId, friendId });
@@ -215,47 +246,62 @@ const handleSocketConnection = (socket, io) => {
       activeRooms.delete(userId);
       activeRooms.delete(friendId);
       randomChatMessages.delete(room.roomId);
-      log('Random chat terminated due to friend request acceptance', { userId, friendId, roomId: room.roomId });
     }
   });
 
-  socket.on('friend_request_rejected', ({ userId, friendId }) => {
-    if (!userId || !friendId || !/^[0-9a-fA-F]{24}$/.test(userId) || !/^[0-9a-fA-F]{24}$/.test(friendId)) {
-      return;
-    }
+  // ── friend_request_rejected (socket notification) ─────────────────────────────
+  socket.on('friend_request_rejected', ({ friendId }) => {
+    const userId = socket.userId;
+
+    if (!friendId || !OBJECT_ID_RE.test(friendId)) return;
+
     const room = activeRooms.get(userId);
     if (room && room.type === 'random' && room.partnerId === friendId) {
-      io.to(room.roomId).emit('friend_request_status', { fromUserId: friendId, toUserId: userId, status: 'rejected' });
-      log('Friend request rejected', { userId, friendId, roomId: room.roomId });
+      io.to(room.roomId).emit('friend_request_status', {
+        fromUserId: friendId,
+        toUserId: userId,
+        status: 'rejected',
+      });
     }
   });
 
-  socket.on('disconnect', () => {
-    if (socket.userId) {
-      searchingUsers.delete(socket.userId);
-      const room = activeRooms.get(socket.userId);
-      if (room) {
-        const timeout = setTimeout(() => {
-          let userSocket = null;
-          io.sockets.sockets.forEach((s) => {
-            if (s.userId === socket.userId && s.connected) {
-              userSocket = s;
-            }
-          });
-          if (!userSocket && activeRooms.get(socket.userId)) {
-            io.to(room.roomId).emit('partner_disconnected', { disconnectedUserId: socket.userId });
-            socket.leave(room.roomId);
-            activeRooms.delete(socket.userId);
-            activeRooms.delete(room.partnerId);
-            randomChatMessages.delete(room.roomId);
-            log('User confirmed disconnected', { userId: socket.userId, roomId: room.roomId });
-          }
-        }, DISCONNECT_GRACE_PERIOD);
-        log('User disconnected, scheduling check', { userId: socket.userId, roomId: room.roomId });
+  // ── disconnect ────────────────────────────────────────────────────────────────
+  socket.on('disconnect', (reason) => {
+    const userId = socket.userId;
+    if (!userId) return;
+
+    searchingUsers.delete(userId);
+    logger.info('Socket disconnected', { userId, reason });
+
+    const room = activeRooms.get(userId);
+    if (!room) return;
+
+    // Grace period: only evict if user doesn't reconnect
+    setTimeout(() => {
+      const stillInRoom = activeRooms.get(userId);
+      if (!stillInRoom) return; // Already cleaned up (e.g. user left intentionally)
+
+      // Check if user has a new socket connected
+      let hasActiveSocket = false;
+      for (const [, s] of io.sockets.sockets) {
+        if (s.userId === userId && s.connected) {
+          hasActiveSocket = true;
+          break;
+        }
       }
-    }
+
+      if (!hasActiveSocket) {
+        io.to(stillInRoom.roomId).emit('partner_disconnected', { disconnectedUserId: userId });
+        activeRooms.delete(userId);
+        activeRooms.delete(stillInRoom.partnerId);
+        randomChatMessages.delete(stillInRoom.roomId);
+        logger.info('User removed after grace period', { userId, roomId: stillInRoom.roomId });
+      }
+    }, DISCONNECT_GRACE_PERIOD);
   });
 };
+
+// ─── Match Logic ──────────────────────────────────────────────────────────────
 
 async function tryMatchUser(userId, socket, io) {
   try {
@@ -265,127 +311,127 @@ async function tryMatchUser(userId, socket, io) {
       return;
     }
 
-    const otherUsers = [...searchingUsers].filter((id) => id !== userId);
-    if (otherUsers.length === 0) {
-      setTimeout(() => tryMatchUser(userId, socket, io), 1000);
+    const candidates = [...searchingUsers].filter((id) => id !== userId);
+    if (candidates.length === 0) {
+      setTimeout(() => tryMatchUser(userId, socket, io), 2000);
       return;
     }
 
-    const friends = user.friends.map((id) => id.toString());
-    let matchedUser = null;
-    for (const otherUserId of otherUsers) {
-      if (!activeRooms.has(otherUserId) && !friends.includes(otherUserId)) {
-        const otherUser = await User.findById(otherUserId).select('user_name friends');
-        if (otherUser && !otherUser.friends.includes(userId)) {
-          matchedUser = otherUserId;
-          break;
-        }
-      }
-    }
+    const friendSet = new Set(user.friends.map((id) => id.toString()));
+    let matchedUserId = null;
 
-    if (!matchedUser) {
-      setTimeout(() => tryMatchUser(userId, socket, io), 1000);
-      return;
-    }
-
-    searchingUsers.delete(userId);
-    searchingUsers.delete(matchedUser);
-
-    const matchedUserData = await User.findById(matchedUser).select('user_name');
-    const roomId = [userId, matchedUser].sort().join('-');
-    activeRooms.set(userId, { roomId, type: 'random', partnerId: matchedUser });
-    activeRooms.set(matchedUser, { roomId, type: 'random', partnerId: userId });
-    randomChatMessages.set(roomId, []);
-
-    socket.join(roomId);
-    let matchedUserSocket = null;
-    for (const [_, s] of io.sockets.sockets) {
-      if (s.userId === matchedUser) {
-        matchedUserSocket = s;
+    for (const candidateId of candidates) {
+      if (activeRooms.has(candidateId) || friendSet.has(candidateId)) continue;
+      const candidate = await User.findById(candidateId).select('friends');
+      if (candidate && !candidate.friends.some((id) => id.toString() === userId)) {
+        matchedUserId = candidateId;
         break;
       }
     }
 
-    if (!matchedUserSocket) {
-      searchingUsers.add(userId);
-      activeRooms.delete(userId);
-      activeRooms.delete(matchedUser);
-      randomChatMessages.delete(roomId);
-      socket.emit('error', { message: 'Matched user not connected' });
+    if (!matchedUserId) {
+      setTimeout(() => tryMatchUser(userId, socket, io), 2000);
       return;
     }
 
-    matchedUserSocket.join(roomId);
-    log('Match created', { userId, matchedUser, roomId });
-    socket.emit('match_found', {
-      partnerId: matchedUser,
-      partnerName: matchedUserData?.user_name || 'Anonymous',
-    });
-    matchedUserSocket.emit('match_found', {
-      partnerId: userId,
-      partnerName: user.user_name || 'Anonymous',
-    });
-    io.to(roomId).emit('chat_ready');
-  } catch (error) {
     searchingUsers.delete(userId);
-    socket.emit('error', { message: 'Server error during matching' });
+    searchingUsers.delete(matchedUserId);
+
+    const matchedUser = await User.findById(matchedUserId).select('user_name');
+    const roomId = [userId, matchedUserId].sort().join('-');
+
+    activeRooms.set(userId, { roomId, type: 'random', partnerId: matchedUserId });
+    activeRooms.set(matchedUserId, { roomId, type: 'random', partnerId: userId });
+    randomChatMessages.set(roomId, []);
+
+    socket.join(roomId);
+
+    let matchedSocket = null;
+    for (const [, s] of io.sockets.sockets) {
+      if (s.userId === matchedUserId) {
+        matchedSocket = s;
+        break;
+      }
+    }
+
+    if (!matchedSocket) {
+      // Matched user disconnected between search and match
+      searchingUsers.add(userId);
+      activeRooms.delete(userId);
+      activeRooms.delete(matchedUserId);
+      randomChatMessages.delete(roomId);
+      socket.emit('error', { message: 'Matched user disconnected. Retrying...' });
+      setTimeout(() => tryMatchUser(userId, socket, io), 1000);
+      return;
+    }
+
+    matchedSocket.join(roomId);
+    logger.info('Match created', { userId, matchedUserId, roomId });
+
+    socket.emit('match_found', { partnerId: matchedUserId, partnerName: matchedUser?.user_name || 'Anonymous' });
+    matchedSocket.emit('match_found', { partnerId: userId, partnerName: user.user_name || 'Anonymous' });
+    io.to(roomId).emit('chat_ready');
+  } catch (err) {
+    searchingUsers.delete(userId);
+    logger.error('Error in tryMatchUser', { userId, error: err.message });
+    socket.emit('error', { message: 'Server error during matching.' });
   }
 }
 
+// ─── HTTP: Send Message (friend chat) ────────────────────────────────────────
+
 const sendMessage = async (req, res) => {
   try {
-    const { userId, friendId, message } = req.body;
+    const userId = req.userId;
+    const { friendId, message } = req.body;
 
-    if (!userId || !friendId || !message || !/^[0-9a-fA-F]{24}$/.test(userId) || !/^[0-9a-fA-F]{24}$/.test(friendId)) {
-      return res.status(400).json({ message: 'Invalid userId, friendId, or message.' });
+    if (!friendId || !OBJECT_ID_RE.test(friendId)) {
+      return res.status(400).json({ message: 'Invalid friendId.' });
+    }
+    if (!message || typeof message !== 'string' || message.trim().length === 0) {
+      return res.status(400).json({ message: 'Message cannot be empty.' });
+    }
+    if (message.length > 2000) {
+      return res.status(400).json({ message: 'Message must not exceed 2000 characters.' });
     }
 
     const user = await User.findById(userId).select('friends');
-    if (!user || !user.friends.includes(friendId)) {
-      return res.status(403).json({ message: 'Users are not friends.' });
+    if (!user || !user.friends.some((id) => id.toString() === friendId)) {
+      return res.status(403).json({ message: 'You are not friends with this user.' });
     }
 
-    let chat = await Chat.findOne({
-      participants: { $all: [userId, friendId] },
-    });
-
+    let chat = await Chat.findOne({ participants: { $all: [userId, friendId] } });
     if (!chat) {
-      chat = new Chat({
-        participants: [userId, friendId],
-        messages: [],
-      });
+      chat = new Chat({ participants: [userId, friendId], messages: [] });
     }
 
     const timestamp = new Date();
-    const messageData = {
-      senderId: userId,
-      text: message,
-      timestamp,
-      seen: false,
-    };
-
-    chat.messages.push(messageData);
+    chat.messages.push({ senderId: userId, text: message.trim(), timestamp, seen: false });
     await chat.save();
 
     const roomId = [userId, friendId].sort().join('_');
     req.io.to(roomId).emit('receive_message', {
-      message,
+      message: message.trim(),
       fromUserId: userId,
       timestamp: timestamp.getTime(),
     });
 
-    res.status(200).json({ message: 'Message sent.' });
+    return res.status(200).json({ message: 'Message sent.' });
   } catch (err) {
-    res.status(500).json({ message: err.message });
+    logger.error('Error in sendMessage', { error: err.message });
+    return res.status(500).json({ message: 'Internal server error.' });
   }
 };
 
+// ─── HTTP: Validate Random Chat (no persistence — socket handles delivery) ────
+
 const sendRandomMessage = async (req, res) => {
   try {
-    const { userId, partnerId, message } = req.body;
+    const userId = req.userId;
+    const { partnerId } = req.body;
 
-    if (!userId || !partnerId || !message || !/^[0-9a-fA-F]{24}$/.test(userId) || !/^[0-9a-fA-F]{24}$/.test(partnerId)) {
-      return res.status(400).json({ message: 'Invalid userId, partnerId, or message.' });
+    if (!partnerId || !OBJECT_ID_RE.test(partnerId)) {
+      return res.status(400).json({ message: 'Invalid partnerId.' });
     }
 
     const room = activeRooms.get(userId);
@@ -393,50 +439,68 @@ const sendRandomMessage = async (req, res) => {
       return res.status(403).json({ message: 'Not in a random chat with this user.' });
     }
 
-    res.status(200).json({ message: 'Message sent.' });
+    // Actual message delivery happens over socket; this endpoint just validates state.
+    return res.status(200).json({ message: 'Room active.' });
   } catch (err) {
-    res.status(500).json({ message: err.message });
+    logger.error('Error in sendRandomMessage', { error: err.message });
+    return res.status(500).json({ message: 'Internal server error.' });
   }
 };
+
+// ─── HTTP: Get Chat History ───────────────────────────────────────────────────
 
 const getChatHistory = async (req, res) => {
   try {
-    const { userId, friendId } = req.params;
+    const userId = req.userId;
+    const { friendId } = req.params;
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 50));
 
-    if (!userId || !friendId || !/^[0-9a-fA-F]{24}$/.test(userId) || !/^[0-9a-fA-F]{24}$/.test(friendId)) {
-      return res.status(400).json({ message: 'Invalid userId or friendId.' });
+    if (!friendId || !OBJECT_ID_RE.test(friendId)) {
+      return res.status(400).json({ message: 'Invalid friendId.' });
     }
 
-    const chat = await Chat.findOne({
-      participants: { $all: [userId, friendId] },
-    });
+    const user = await User.findById(userId).select('friends');
+    if (!user || !user.friends.some((id) => id.toString() === friendId)) {
+      return res.status(403).json({ message: 'You are not friends with this user.' });
+    }
 
-    res.status(200).json({ messages: chat ? chat.messages : [] });
+    const chat = await Chat.findOne({ participants: { $all: [userId, friendId] } });
+    if (!chat) {
+      return res.status(200).json({ messages: [], total: 0, page, limit });
+    }
+
+    const total = chat.messages.length;
+    const startIndex = Math.max(0, total - page * limit);
+    const endIndex = total - (page - 1) * limit;
+    const messages = chat.messages.slice(startIndex, endIndex);
+
+    return res.status(200).json({ messages, total, page, limit });
   } catch (err) {
-    res.status(500).json({ message: err.message });
+    logger.error('Error in getChatHistory', { error: err.message });
+    return res.status(500).json({ message: 'Internal server error.' });
   }
 };
 
+// ─── HTTP: Mark Message Seen ──────────────────────────────────────────────────
+
 const markMessageSeen = async (req, res) => {
   try {
-    const { userId, friendId, timestamp } = req.body;
+    const userId = req.userId;
+    const { friendId, timestamp } = req.body;
 
-    if (!userId || !friendId || !timestamp || !/^[0-9a-fA-F]{24}$/.test(userId) || !/^[0-9a-fA-F]{24}$/.test(friendId)) {
-      return res.status(400).json({ message: 'Invalid userId, friendId, or timestamp.' });
+    if (!friendId || !OBJECT_ID_RE.test(friendId) || !timestamp) {
+      return res.status(400).json({ message: 'Invalid friendId or timestamp.' });
     }
 
-    const chat = await Chat.findOne({
-      participants: { $all: [userId, friendId] },
-    });
-
+    const chat = await Chat.findOne({ participants: { $all: [userId, friendId] } });
     if (!chat) {
       return res.status(404).json({ message: 'Chat not found.' });
     }
 
     const message = chat.messages.find(
-      (msg) => msg.timestamp.getTime() === timestamp && msg.senderId.toString() === friendId
+      (m) => m.timestamp.getTime() === Number(timestamp) && m.senderId.toString() === friendId
     );
-
     if (!message) {
       return res.status(404).json({ message: 'Message not found.' });
     }
@@ -447,9 +511,10 @@ const markMessageSeen = async (req, res) => {
     const roomId = [userId, friendId].sort().join('_');
     req.io.to(roomId).emit('message_seen', { fromUserId: userId, timestamp });
 
-    res.status(200).json({ message: 'Message marked as seen.' });
+    return res.status(200).json({ message: 'Message marked as seen.' });
   } catch (err) {
-    res.status(500).json({ message: err.message });
+    logger.error('Error in markMessageSeen', { error: err.message });
+    return res.status(500).json({ message: 'Internal server error.' });
   }
 };
 
