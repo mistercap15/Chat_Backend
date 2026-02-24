@@ -1,9 +1,42 @@
+const { Expo } = require('expo-server-sdk');
 const User = require('../models/User');
 const Chat = require('../models/Chat');
 const { activeRooms, randomChatMessages } = require('../utils/activeRooms');
 const logger = require('../utils/logger');
+const { sendPushToUser, templates } = require('../utils/pushNotifications');
 
 const OBJECT_ID_RE = /^[0-9a-fA-F]{24}$/;
+
+// ─── Update Push Token ────────────────────────────────────────────────────────
+
+/**
+ * PUT /api/users/push-token
+ * Registers or clears the Expo push token for the authenticated user.
+ * Body: { token: string | null }
+ */
+exports.updatePushToken = async (req, res) => {
+  try {
+    const userId = req.userId;
+    const { token } = req.body;
+
+    // Allow null/empty to clear the token (e.g. user revokes notification permission)
+    if (token !== null && token !== undefined && token !== '') {
+      if (!Expo.isExpoPushToken(token)) {
+        return res.status(400).json({ message: 'Invalid Expo push token format.' });
+      }
+    }
+
+    await User.findByIdAndUpdate(userId, {
+      expoPushToken: token || null,
+    });
+
+    logger.info('Push token updated', { userId, hasToken: !!token });
+    return res.status(200).json({ message: token ? 'Push token registered.' : 'Push token cleared.' });
+  } catch (err) {
+    logger.error('Error in updatePushToken', { error: err.message });
+    return res.status(500).json({ message: 'Internal server error.' });
+  }
+};
 
 // ─── Update User ─────────────────────────────────────────────────────────────
 
@@ -131,6 +164,13 @@ exports.sendFriendRequest = async (req, res) => {
       });
     }
 
+    // Push notification — fire-and-forget, do not await to avoid blocking response
+    sendPushToUser(
+      friendId,
+      templates.friendRequest(user.user_name, userId),
+      User
+    ).catch((err) => logger.error('Push failed for friendRequest', { error: err.message }));
+
     logger.info('Friend request sent', { fromUserId: userId, toUserId: friendId });
     return res.status(200).json({ message: 'Friend request sent.' });
   } catch (err) {
@@ -193,6 +233,13 @@ exports.acceptFriendRequest = async (req, res) => {
     req.io.to(friendId).emit('friend_request_accepted', { userId: friendId, friendId: userId, friendUsername: user.user_name });
     req.io.to(userId).emit('friend_added', { friendId, friendUsername: friend.user_name });
     req.io.to(friendId).emit('friend_added', { friendId: userId, friendUsername: user.user_name });
+
+    // Push notification to the original requester (friendId sent the request, userId accepted it)
+    sendPushToUser(
+      friendId,
+      templates.friendAccepted(user.user_name, userId),
+      User
+    ).catch((err) => logger.error('Push failed for friendAccepted', { error: err.message }));
 
     logger.info('Friend request accepted', { userId, friendId });
     return res.status(200).json({ message: 'Friend request accepted.' });

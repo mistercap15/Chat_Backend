@@ -33,6 +33,7 @@ const userSchema = new mongoose.Schema(
         status: { type: String, enum: ['pending', 'accepted'], default: 'pending' },
       },
     ],
+    expoPushToken: { type: String, default: null },
     isActive: { type: Boolean, default: true },
     lastSeen: { type: Date, default: Date.now },
   },

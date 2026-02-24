@@ -23,4 +23,7 @@ router.get('/me/friend-requests', userController.getPendingFriendRequests);
 router.delete('/friends/:friendId', userController.removeFriend);
 router.delete('/account', userController.deleteUser);
 
+// Push notification token management
+router.put('/push-token', userController.updatePushToken);
+
 module.exports = router;

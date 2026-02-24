@@ -3,6 +3,7 @@ const User = require('../models/User');
 const Chat = require('../models/Chat');
 const { activeRooms, randomChatMessages } = require('../utils/activeRooms');
 const logger = require('../utils/logger');
+const { sendPushToUser, isUserActiveInRoom, templates } = require('../utils/pushNotifications');
 
 const searchingUsers = new Set();
 const DISCONNECT_GRACE_PERIOD = 60000; // 60 seconds
@@ -368,9 +369,18 @@ async function tryMatchUser(userId, socket, io) {
     matchedSocket.join(roomId);
     logger.info('Match created', { userId, matchedUserId, roomId });
 
-    socket.emit('match_found', { partnerId: matchedUserId, partnerName: matchedUser?.user_name || 'Anonymous' });
-    matchedSocket.emit('match_found', { partnerId: userId, partnerName: user.user_name || 'Anonymous' });
+    const userPartnerName = user.user_name || 'Anonymous';
+    const matchedPartnerName = matchedUser?.user_name || 'Anonymous';
+
+    socket.emit('match_found', { partnerId: matchedUserId, partnerName: matchedPartnerName });
+    matchedSocket.emit('match_found', { partnerId: userId, partnerName: userPartnerName });
     io.to(roomId).emit('chat_ready');
+
+    // Push notifications for random match — sent in parallel, fire-and-forget
+    Promise.all([
+      sendPushToUser(userId, templates.randomMatchFound(matchedPartnerName, matchedUserId), User),
+      sendPushToUser(matchedUserId, templates.randomMatchFound(userPartnerName, userId), User),
+    ]).catch((err) => logger.error('Push failed for randomMatch', { error: err.message }));
   } catch (err) {
     searchingUsers.delete(userId);
     logger.error('Error in tryMatchUser', { userId, error: err.message });
@@ -395,7 +405,7 @@ const sendMessage = async (req, res) => {
       return res.status(400).json({ message: 'Message must not exceed 2000 characters.' });
     }
 
-    const user = await User.findById(userId).select('friends');
+    const user = await User.findById(userId).select('user_name friends');
     if (!user || !user.friends.some((id) => id.toString() === friendId)) {
       return res.status(403).json({ message: 'You are not friends with this user.' });
     }
@@ -406,15 +416,25 @@ const sendMessage = async (req, res) => {
     }
 
     const timestamp = new Date();
-    chat.messages.push({ senderId: userId, text: message.trim(), timestamp, seen: false });
+    const trimmedMessage = message.trim();
+    chat.messages.push({ senderId: userId, text: trimmedMessage, timestamp, seen: false });
     await chat.save();
 
     const roomId = [userId, friendId].sort().join('_');
     req.io.to(roomId).emit('receive_message', {
-      message: message.trim(),
+      message: trimmedMessage,
       fromUserId: userId,
       timestamp: timestamp.getTime(),
     });
+
+    // Send push only when the recipient is NOT actively viewing this chat
+    if (!isUserActiveInRoom(req.io, friendId, roomId)) {
+      sendPushToUser(
+        friendId,
+        templates.newMessage(user.user_name, trimmedMessage, userId),
+        User
+      ).catch((err) => logger.error('Push failed for sendMessage', { error: err.message }));
+    }
 
     return res.status(200).json({ message: 'Message sent.' });
   } catch (err) {
