@@ -1,6 +1,7 @@
 const { Expo } = require('expo-server-sdk');
 const User = require('../models/User');
 const Chat = require('../models/Chat');
+const Message = require('../models/Message');
 const { activeRooms, randomChatMessages } = require('../utils/activeRooms');
 const logger = require('../utils/logger');
 const { sendPushToUser, templates } = require('../utils/pushNotifications');
@@ -219,9 +220,19 @@ exports.acceptFriendRequest = async (req, res) => {
     if (messages.length > 0) {
       let chat = await Chat.findOne({ participants: { $all: [userId, friendId] } });
       if (!chat) {
-        chat = new Chat({ participants: [userId, friendId], messages: [] });
+        chat = await Chat.create({ participants: [userId, friendId], lastMessageAt: null });
       }
-      chat.messages.push(...messages);
+      await Message.insertMany(
+        messages.map((m) => ({
+          chatId: chat._id,
+          senderId: m.senderId,
+          text: m.text,
+          seen: !!m.seen,
+          createdAt: m.timestamp || new Date(),
+          updatedAt: m.timestamp || new Date(),
+        }))
+      );
+      chat.lastMessageAt = new Date();
       await chat.save();
       randomChatMessages.delete(roomId);
     }
@@ -324,7 +335,13 @@ exports.removeFriend = async (req, res) => {
     await Promise.all([
       user.save(),
       friend.save(),
-      Chat.deleteOne({ participants: { $all: [userId, friendId] } }),
+      (async () => {
+        const chat = await Chat.findOne({ participants: { $all: [userId, friendId] } });
+        if (chat) {
+          await Message.deleteMany({ chatId: chat._id });
+          await Chat.deleteOne({ _id: chat._id });
+        }
+      })(),
     ]);
 
     req.io.to(userId).emit('friend_removed', { removedUserId: friendId });
@@ -357,7 +374,14 @@ exports.deleteUser = async (req, res) => {
         { 'friendRequests.fromUserId': userId },
         { $pull: { friendRequests: { fromUserId: userId } } }
       ),
-      Chat.deleteMany({ participants: userId }),
+      (async () => {
+        const chats = await Chat.find({ participants: userId }).select('_id');
+        const chatIds = chats.map((c) => c._id);
+        if (chatIds.length > 0) {
+          await Message.deleteMany({ chatId: { $in: chatIds } });
+          await Chat.deleteMany({ _id: { $in: chatIds } });
+        }
+      })(),
     ]);
 
     // Clean up in-memory state
