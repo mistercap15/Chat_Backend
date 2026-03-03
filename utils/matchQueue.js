@@ -35,12 +35,17 @@ const matchQueue = new Queue('matching', {
  * A second call while a job is already queued is safely ignored.
  */
 const enqueueMatchRetry = async (userId) => {
+  // BullMQ 5.x throws JobIdConflictError when a job with the same ID already exists,
+  // and prohibits colons in custom job IDs. Remove any stale job first.
+  const existing = await matchQueue.getJob(`match_${userId}`);
+  if (existing) await existing.remove().catch(() => {});
+
   await matchQueue.add(
     'try-match',
     { userId },
     {
       delay: INITIAL_DELAY_MS,
-      jobId: `match:${userId}`,
+      jobId: `match_${userId}`,
     }
   );
 };
@@ -49,7 +54,7 @@ const enqueueMatchRetry = async (userId) => {
  * Removes any queued matchmaking job for a user (e.g. when they stop searching).
  */
 const cancelMatchRetry = async (userId) => {
-  const job = await matchQueue.getJob(`match:${userId}`);
+  const job = await matchQueue.getJob(`match_${userId}`);
   if (job) await job.remove().catch(() => {});
 };
 

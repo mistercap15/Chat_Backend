@@ -161,6 +161,9 @@ const handleSocketConnection = (socket, io) => {
       }
     } catch (err) {
       logger.error('Error in start_search', { userId, error: err.message });
+      // Roll back: atomicMatch may have already added the user to the searching set.
+      // Clean up so they can retry without hitting "Already in a search or chat."
+      await removeSearching(userId).catch(() => {});
       socket.emit('error', { message: 'Server error during search.' });
     }
   });
@@ -245,7 +248,10 @@ const handleSocketConnection = (socket, io) => {
     try {
       const room = await getRoom(userId);
       if (room && room.type === 'friend' && room.partnerId === friendId) {
-        socket.leave(room.roomId);
+        // Evict BOTH users' sockets from the room so the recipient doesn't
+        // stay subscribed and receive double receive_message events later.
+        io.in(userId).socketsLeave(room.roomId);
+        io.in(friendId).socketsLeave(room.roomId);
         await deleteRoom(userId);
         io.to(friendId).emit('partner_left', { userId });
         logger.info('User left friend chat', { userId, friendId });
@@ -376,19 +382,23 @@ const handleSocketConnection = (socket, io) => {
   socket.on('friend_request_accepted', async ({ friendId }) => {
     if (!friendId || !OBJECT_ID_RE.test(friendId)) return;
     try {
-      const room = await getRoom(userId);
-      if (room && room.type === 'random' && room.partnerId === friendId) {
-        io.to(room.roomId).emit('friend_request_accepted', { userId, friendId });
-        io.to(room.roomId).emit('partner_disconnected', { disconnectedUserId: userId });
-        io.to(room.roomId).emit('partner_disconnected', { disconnectedUserId: friendId });
-        socket.leave(room.roomId);
-        io.in(friendId).socketsLeave(room.roomId);
-        await Promise.all([
-          deleteRoom(userId),
-          deleteRoom(friendId),
-          deleteRandomMessages(room.roomId),
-        ]);
-      }
+      // Derive the random-chat room ID directly — the HTTP acceptFriendRequest endpoint
+      // already cleared Redis state, so getRoom(userId) would return null and the old
+      // room-gated check would silently drop this event, leaving user A stuck in the chat screen.
+      const randomRoomId = [userId, friendId].sort().join('-');
+
+      io.to(randomRoomId).emit('friend_request_accepted', { userId, friendId });
+      io.to(randomRoomId).emit('partner_disconnected', { disconnectedUserId: userId });
+      io.to(randomRoomId).emit('partner_disconnected', { disconnectedUserId: friendId });
+      socket.leave(randomRoomId);
+      io.in(friendId).socketsLeave(randomRoomId);
+
+      // Belt-and-suspenders cleanup — no-op if HTTP already handled it
+      await Promise.all([
+        deleteRoom(userId),
+        deleteRoom(friendId),
+        deleteRandomMessages(randomRoomId),
+      ]).catch(() => {});
     } catch (err) {
       logger.error('Error in friend_request_accepted socket event', { userId, error: err.message });
     }
@@ -508,13 +518,20 @@ const sendMessage = async (req, res) => {
     await chat.save();
 
     const roomId = [userId, friendId].sort().join('_');
-    req.io.to(roomId).emit('receive_message', {
+    const msgPayload = {
       _id: newMessage._id,
       message: trimmed,
       fromUserId: userId,
       timestamp: newMessage.createdAt.getTime(),
       clientMessageId: newMessage.clientMessageId,
-    });
+    };
+    // Emit to the chat room for users who have the chat screen open.
+    req.io.to(roomId).emit('receive_message', msgPayload);
+    // Emit a lightweight notification to the recipient's personal room for unread badge
+    // tracking. Using a separate event avoids double-counting: if the recipient's socket
+    // is in both the chat room and their personal room (e.g. the sender called
+    // start_friend_chat), receive_message would fire twice via the global listener.
+    req.io.to(friendId).emit('friend_message_notification', { fromUserId: userId });
 
     // Only push if the recipient is not actively viewing the chat
     const recipientActive = await isUserActiveInRoom(req.io, friendId, roomId);
@@ -633,31 +650,23 @@ const markMessageSeen = async (req, res) => {
       return res.status(404).json({ message: 'Chat not found.' });
     }
 
-    const query = { chatId: chat._id, senderId: friendId };
-    if (messageId && OBJECT_ID_RE.test(String(messageId))) {
-      query._id = messageId;
-    } else {
-      query.createdAt = new Date(Number(timestamp));
-    }
+    // Mark ALL unseen messages from the friend up to (and including) the given timestamp.
+    // This ensures every message in the conversation is marked, not just the one with an exact match.
+    const seenAt = new Date();
+    const cutoff = new Date(Number(timestamp));
 
-    const updated = await Message.findOneAndUpdate(
-      query,
-      { seen: true, seenAt: new Date() },
-      { new: true }
+    const result = await Message.updateMany(
+      { chatId: chat._id, senderId: friendId, seen: false, createdAt: { $lte: cutoff } },
+      { seen: true, seenAt }
     );
-
-    if (!updated) {
-      return res.status(404).json({ message: 'Message not found.' });
-    }
 
     const roomId = [userId, friendId].sort().join('_');
     req.io.to(roomId).emit('message_seen', {
       fromUserId: userId,
-      timestamp: updated.createdAt.getTime(),
-      messageId: updated._id,
+      timestamp: Number(timestamp),
     });
 
-    return res.status(200).json({ message: 'Message marked as seen.', messageId: updated._id });
+    return res.status(200).json({ message: 'Messages marked as seen.', count: result.modifiedCount });
   } catch (err) {
     logger.error('Error in markMessageSeen', { error: err.message });
     return res.status(500).json({ message: 'Internal server error.' });

@@ -40,11 +40,6 @@ const io = socketIo(server, {
   pingInterval: 25000,
 });
 
-// ─── Socket.IO: Redis Adapter ─────────────────────────────────────────────────
-// This single line makes io.to(room).emit() and io.fetchSockets() work across
-// ALL server instances. Without this, users on different instances can't chat.
-io.adapter(createAdapter(pubClient, subClient));
-
 // ─── Socket.IO: JWT Authentication ───────────────────────────────────────────
 
 io.use((socket, next) => {
@@ -210,15 +205,16 @@ process.on('unhandledRejection', (reason) => {
 const PORT = process.env.PORT || 5000;
 
 const start = async () => {
-  // Connect DB and all three Redis clients concurrently
+  await connectDB();
+
+  // ❌ DO NOT call redis.connect()
   await Promise.all([
-    connectDB(),
-    redis.connect(),
     pubClient.connect(),
     subClient.connect(),
   ]);
 
-  // Start the BullMQ matchmaking worker (needs io + performMatch from chatController)
+  io.adapter(createAdapter(pubClient, subClient));
+
   createMatchWorker(io, performMatch);
   logger.info('Matchmaking worker started');
 

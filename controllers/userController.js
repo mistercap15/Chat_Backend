@@ -9,6 +9,7 @@ const Message = require('../models/Message');
 const {
   getRoom,
   deleteRoom,
+  getRandomMessages,
   deleteRandomMessages,
 } = require('../utils/roomState');
 const logger = require('../utils/logger');
@@ -276,8 +277,9 @@ exports.acceptFriendRequest = async (req, res) => {
       deleteRandomMessages(roomId),
     ]);
 
-    req.io.to(userId).emit('friend_request_accepted', { userId, friendId, friendUsername: friend.user_name });
-    req.io.to(friendId).emit('friend_request_accepted', { userId: friendId, friendId: userId, friendUsername: user.user_name });
+    // Notify both users with a single consistent event.
+    // friend_request_accepted is intentionally NOT emitted here — that event name
+    // is reserved for the in-random-chat socket signal and must not collide with HTTP notifications.
     req.io.to(userId).emit('friend_added', { friendId, friendUsername: friend.user_name });
     req.io.to(friendId).emit('friend_added', { friendId: userId, friendUsername: user.user_name });
 
@@ -321,8 +323,7 @@ exports.rejectFriendRequest = async (req, res) => {
     }
 
     user.friendRequests = user.friendRequests.filter((r) => r.fromUserId.toString() !== friendId);
-    friend.friendRequests = friend.friendRequests.filter((r) => r.fromUserId.toString() !== userId);
-    await Promise.all([user.save(), friend.save()]);
+    await user.save();
 
     const room = await getRoom(userId);
     if (room && room.type === 'random' && room.partnerId === friendId) {
@@ -378,6 +379,13 @@ exports.removeFriend = async (req, res) => {
         }
       })(),
     ]);
+
+    // Clean up Redis friend-chat room state and evict both users' sockets from the room.
+    // The friend chat room key uses underscore-joined sorted IDs (distinct from random chat rooms).
+    const friendRoomId = [userId, friendId].sort().join('_');
+    await Promise.all([deleteRoom(userId), deleteRoom(friendId)]).catch(() => {});
+    req.io.in(userId).socketsLeave(friendRoomId);
+    req.io.in(friendId).socketsLeave(friendRoomId);
 
     req.io.to(userId).emit('friend_removed', { removedUserId: friendId });
     req.io.to(friendId).emit('friend_removed', { removedUserId: userId });
