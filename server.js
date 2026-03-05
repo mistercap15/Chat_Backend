@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
+const { createAdapter } = require('@socket.io/redis-adapter');
 const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
@@ -10,13 +11,15 @@ const mongoose = require('mongoose');
 
 const logger = require('./utils/logger');
 const { connectDB } = require('./config/db');
+const { redis, pubClient, subClient } = require('./config/redis');
 const { generalLimiter } = require('./middlewares/rateLimit');
 
 const userRoutes = require('./routes/user');
 const chatRoutes = require('./routes/chat');
 const authRoutes = require('./routes/auth');
 const adminRoutes = require('./routes/admin');
-const { handleSocketConnection } = require('./controllers/chatController');
+const { handleSocketConnection, performMatch } = require('./controllers/chatController');
+const { createMatchWorker } = require('./utils/matchQueue');
 
 // ─── App & Server Setup ───────────────────────────────────────────────────────
 
@@ -46,7 +49,11 @@ io.use((socket, next) => {
   }
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    // socket.userId   — available on local socket event handlers
+    // socket.data.userId — serialised by the Redis adapter; available in
+    //                      io.fetchSockets() responses from remote instances
     socket.userId = decoded.userId;
+    socket.data.userId = decoded.userId;
     next();
   } catch (err) {
     logger.warn('Socket JWT verification failed', { error: err.message });
@@ -101,9 +108,6 @@ app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 app.use(generalLimiter);
 
-// Serve uploaded files
-app.use('/uploads', express.static('uploads'));
-
 // Attach Socket.IO instance to every request
 app.use((req, _res, next) => {
   req.io = io;
@@ -119,13 +123,16 @@ app.use('/api/admin', adminRoutes);
 
 // ─── Health Check ─────────────────────────────────────────────────────────────
 
-app.get('/health', (_req, res) => {
+app.get('/health', async (_req, res) => {
   const dbState = mongoose.connection.readyState;
   const dbStatus = ['disconnected', 'connected', 'connecting', 'disconnecting'][dbState] || 'unknown';
-  const status = dbState === 1 ? 'ok' : 'degraded';
-  res.status(dbState === 1 ? 200 : 503).json({
-    status,
+  const redisStatus = redis.status; // 'ready' | 'connecting' | 'close' | etc.
+  const healthy = dbState === 1 && redisStatus === 'ready';
+
+  res.status(healthy ? 200 : 503).json({
+    status: healthy ? 'ok' : 'degraded',
     db: dbStatus,
+    redis: redisStatus,
     uptime: process.uptime(),
     timestamp: new Date().toISOString(),
   });
@@ -143,7 +150,6 @@ app.use((req, res) => {
 
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, _next) => {
-  // Handle multer errors
   if (err.code === 'LIMIT_FILE_SIZE') {
     return res.status(400).json({ message: 'File too large. Maximum size is 5 MB.' });
   }
@@ -163,15 +169,19 @@ const gracefulShutdown = (signal) => {
   server.close(async () => {
     logger.info('HTTP server closed.');
     try {
-      await mongoose.connection.close();
-      logger.info('MongoDB connection closed.');
+      await Promise.all([
+        mongoose.connection.close(),
+        redis.quit(),
+        pubClient.quit(),
+        subClient.quit(),
+      ]);
+      logger.info('MongoDB and Redis connections closed.');
     } catch (err) {
-      logger.error('Error closing MongoDB', { error: err.message });
+      logger.error('Error during shutdown', { error: err.message });
     }
     process.exit(0);
   });
 
-  // Force exit if shutdown takes too long
   setTimeout(() => {
     logger.error('Graceful shutdown timed out. Forcing exit.');
     process.exit(1);
@@ -190,17 +200,30 @@ process.on('unhandledRejection', (reason) => {
   logger.error('Unhandled promise rejection', { reason: String(reason) });
 });
 
-// ─── Start: DB first, then listen ────────────────────────────────────────────
+// ─── Start: DB + Redis first, then listen ────────────────────────────────────
 
 const PORT = process.env.PORT || 5000;
 
-connectDB()
-  .then(() => {
-    server.listen(PORT, '0.0.0.0', () => {
-      logger.info(`Server running on http://0.0.0.0:${PORT}`);
-    });
-  })
-  .catch((err) => {
-    logger.error('Failed to connect to MongoDB, aborting startup', { error: err.message });
-    process.exit(1);
+const start = async () => {
+  await connectDB();
+
+  // ❌ DO NOT call redis.connect()
+  await Promise.all([
+    pubClient.connect(),
+    subClient.connect(),
+  ]);
+
+  io.adapter(createAdapter(pubClient, subClient));
+
+  createMatchWorker(io, performMatch);
+  logger.info('Matchmaking worker started');
+
+  server.listen(PORT, '0.0.0.0', () => {
+    logger.info(`Server running on http://0.0.0.0:${PORT}`);
   });
+};
+
+start().catch((err) => {
+  logger.error('Startup failed', { error: err.message });
+  process.exit(1);
+});

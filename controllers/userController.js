@@ -1,7 +1,17 @@
 const { Expo } = require('expo-server-sdk');
+const { randomUUID } = require('crypto');
+const path = require('path');
+const { PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
+const { s3, S3_BUCKET, S3_PUBLIC_URL } = require('../config/s3');
 const User = require('../models/User');
 const Chat = require('../models/Chat');
-const { activeRooms, randomChatMessages } = require('../utils/activeRooms');
+const Message = require('../models/Message');
+const {
+  getRoom,
+  deleteRoom,
+  getRandomMessages,
+  deleteRandomMessages,
+} = require('../utils/roomState');
 const logger = require('../utils/logger');
 const { sendPushToUser, templates } = require('../utils/pushNotifications');
 
@@ -9,26 +19,18 @@ const OBJECT_ID_RE = /^[0-9a-fA-F]{24}$/;
 
 // ─── Update Push Token ────────────────────────────────────────────────────────
 
-/**
- * PUT /api/users/push-token
- * Registers or clears the Expo push token for the authenticated user.
- * Body: { token: string | null }
- */
 exports.updatePushToken = async (req, res) => {
   try {
     const userId = req.userId;
     const { token } = req.body;
 
-    // Allow null/empty to clear the token (e.g. user revokes notification permission)
     if (token !== null && token !== undefined && token !== '') {
       if (!Expo.isExpoPushToken(token)) {
         return res.status(400).json({ message: 'Invalid Expo push token format.' });
       }
     }
 
-    await User.findByIdAndUpdate(userId, {
-      expoPushToken: token || null,
-    });
+    await User.findByIdAndUpdate(userId, { expoPushToken: token || null });
 
     logger.info('Push token updated', { userId, hasToken: !!token });
     return res.status(200).json({ message: token ? 'Push token registered.' : 'Push token cleared.' });
@@ -38,11 +40,11 @@ exports.updatePushToken = async (req, res) => {
   }
 };
 
-// ─── Update User ─────────────────────────────────────────────────────────────
+// ─── Update User ──────────────────────────────────────────────────────────────
 
 exports.updateUser = async (req, res) => {
   try {
-    const userId = req.userId; // set by auth middleware
+    const userId = req.userId;
     const { user_name, gender, bio, interests } = req.body;
 
     if (!user_name || typeof user_name !== 'string' || user_name.trim().length < 2) {
@@ -105,12 +107,45 @@ exports.uploadProfilePicture = async (req, res) => {
       return res.status(404).json({ message: 'User not found.' });
     }
 
-    const relativePath = `/uploads/${req.file.filename}`;
-    user.profilePicture = relativePath;
+    // Delete the previous picture from S3 if it was uploaded there
+    if (user.profilePicture && S3_BUCKET) {
+      try {
+        // S3 URLs look like https://bucket.s3.region.amazonaws.com/profiles/...
+        // R2 URLs look like https://pub-xxx.r2.dev/profiles/... or custom domain
+        // We store the full URL, so extract the key by stripping the base URL
+        const oldUrl = user.profilePicture;
+        if (oldUrl.startsWith('http')) {
+          const urlObj = new URL(oldUrl);
+          // The key is the pathname without the leading slash
+          const key = urlObj.pathname.slice(1);
+          if (key.startsWith('profiles/')) {
+            await s3.send(new DeleteObjectCommand({ Bucket: S3_BUCKET, Key: key }));
+          }
+        }
+      } catch {
+        // Non-fatal — old file may already be gone; log and continue
+        logger.warn('Could not delete old profile picture from S3', { userId });
+      }
+    }
+
+    const ext = path.extname(req.file.originalname).toLowerCase() || '.jpg';
+    const key = `profiles/${userId}-${randomUUID()}${ext}`;
+
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: S3_BUCKET,
+        Key: key,
+        Body: req.file.buffer,
+        ContentType: req.file.mimetype,
+      })
+    );
+
+    const url = `${S3_PUBLIC_URL}/${key}`;
+    user.profilePicture = url;
     await user.save();
 
-    logger.info('Profile picture updated', { userId });
-    return res.status(200).json({ message: 'Profile picture updated.', profilePicture: relativePath });
+    logger.info('Profile picture updated', { userId, key });
+    return res.status(200).json({ message: 'Profile picture updated.', profilePicture: url });
   } catch (err) {
     logger.error('Error in uploadProfilePicture', { error: err.message });
     return res.status(500).json({ message: 'Internal server error.' });
@@ -154,7 +189,7 @@ exports.sendFriendRequest = async (req, res) => {
       fromUsername: user.user_name,
     });
 
-    const room = activeRooms.get(userId);
+    const room = await getRoom(userId);
     if (room && room.type === 'random' && room.partnerId === friendId) {
       req.io.to(room.roomId).emit('friend_request_status', {
         fromUserId: userId,
@@ -164,7 +199,6 @@ exports.sendFriendRequest = async (req, res) => {
       });
     }
 
-    // Push notification — fire-and-forget, do not await to avoid blocking response
     sendPushToUser(
       friendId,
       templates.friendRequest(user.user_name, userId),
@@ -211,30 +245,44 @@ exports.acceptFriendRequest = async (req, res) => {
     friend.friends.push(userId);
     user.friendRequests = user.friendRequests.filter((r) => r.fromUserId.toString() !== friendId);
 
+    // Migrate random chat messages from Redis → MongoDB before cleaning up
+    const roomId = [userId, friendId].sort().join('-');
+    const messages = await getRandomMessages(roomId);
+
     await Promise.all([user.save(), friend.save()]);
 
-    // Persist any random chat messages into permanent chat history
-    const roomId = [userId, friendId].sort().join('-');
-    const messages = randomChatMessages.get(roomId) || [];
     if (messages.length > 0) {
       let chat = await Chat.findOne({ participants: { $all: [userId, friendId] } });
       if (!chat) {
-        chat = new Chat({ participants: [userId, friendId], messages: [] });
+        chat = await Chat.create({ participants: [userId, friendId], lastMessageAt: null });
       }
-      chat.messages.push(...messages);
+      await Message.insertMany(
+        messages.map((m) => ({
+          chatId: chat._id,
+          senderId: m.senderId,
+          text: m.text,
+          seen: !!m.seen,
+          createdAt: m.timestamp || new Date(),
+          updatedAt: m.timestamp || new Date(),
+        }))
+      );
+      chat.lastMessageAt = new Date();
       await chat.save();
-      randomChatMessages.delete(roomId);
     }
 
-    activeRooms.delete(userId);
-    activeRooms.delete(friendId);
+    // Clean up Redis state for both users
+    await Promise.all([
+      deleteRoom(userId),
+      deleteRoom(friendId),
+      deleteRandomMessages(roomId),
+    ]);
 
-    req.io.to(userId).emit('friend_request_accepted', { userId, friendId, friendUsername: friend.user_name });
-    req.io.to(friendId).emit('friend_request_accepted', { userId: friendId, friendId: userId, friendUsername: user.user_name });
+    // Notify both users with a single consistent event.
+    // friend_request_accepted is intentionally NOT emitted here — that event name
+    // is reserved for the in-random-chat socket signal and must not collide with HTTP notifications.
     req.io.to(userId).emit('friend_added', { friendId, friendUsername: friend.user_name });
     req.io.to(friendId).emit('friend_added', { friendId: userId, friendUsername: user.user_name });
 
-    // Push notification to the original requester (friendId sent the request, userId accepted it)
     sendPushToUser(
       friendId,
       templates.friendAccepted(user.user_name, userId),
@@ -275,10 +323,9 @@ exports.rejectFriendRequest = async (req, res) => {
     }
 
     user.friendRequests = user.friendRequests.filter((r) => r.fromUserId.toString() !== friendId);
-    friend.friendRequests = friend.friendRequests.filter((r) => r.fromUserId.toString() !== userId);
-    await Promise.all([user.save(), friend.save()]);
+    await user.save();
 
-    const room = activeRooms.get(userId);
+    const room = await getRoom(userId);
     if (room && room.type === 'random' && room.partnerId === friendId) {
       req.io.to(room.roomId).emit('friend_request_status', {
         fromUserId: friendId,
@@ -324,8 +371,21 @@ exports.removeFriend = async (req, res) => {
     await Promise.all([
       user.save(),
       friend.save(),
-      Chat.deleteOne({ participants: { $all: [userId, friendId] } }),
+      (async () => {
+        const chat = await Chat.findOne({ participants: { $all: [userId, friendId] } });
+        if (chat) {
+          await Message.deleteMany({ chatId: chat._id });
+          await Chat.deleteOne({ _id: chat._id });
+        }
+      })(),
     ]);
+
+    // Clean up Redis friend-chat room state and evict both users' sockets from the room.
+    // The friend chat room key uses underscore-joined sorted IDs (distinct from random chat rooms).
+    const friendRoomId = [userId, friendId].sort().join('_');
+    await Promise.all([deleteRoom(userId), deleteRoom(friendId)]).catch(() => {});
+    req.io.in(userId).socketsLeave(friendRoomId);
+    req.io.in(friendId).socketsLeave(friendRoomId);
 
     req.io.to(userId).emit('friend_removed', { removedUserId: friendId });
     req.io.to(friendId).emit('friend_removed', { removedUserId: userId });
@@ -351,25 +411,33 @@ exports.deleteUser = async (req, res) => {
 
     const friendIds = user.friends.map((id) => id.toString());
 
+    // Clean up DB records
     await Promise.all([
       User.updateMany({ friends: userId }, { $pull: { friends: userId } }),
       User.updateMany(
         { 'friendRequests.fromUserId': userId },
         { $pull: { friendRequests: { fromUserId: userId } } }
       ),
-      Chat.deleteMany({ participants: userId }),
+      (async () => {
+        const chats = await Chat.find({ participants: userId }).select('_id');
+        const chatIds = chats.map((c) => c._id);
+        if (chatIds.length > 0) {
+          await Message.deleteMany({ chatId: { $in: chatIds } });
+          await Chat.deleteMany({ _id: { $in: chatIds } });
+        }
+      })(),
     ]);
 
-    // Clean up in-memory state
-    activeRooms.delete(userId);
-    for (const [key, room] of activeRooms) {
-      if (room.partnerId === userId) {
-        randomChatMessages.delete(room.roomId); // Fix: use room.roomId, not key
-        activeRooms.delete(key);
-      }
+    // Clean up Redis room state for this user
+    const room = await getRoom(userId).catch(() => null);
+    if (room) {
+      await Promise.all([
+        deleteRoom(userId),
+        deleteRoom(room.partnerId),
+        deleteRandomMessages(room.roomId),
+      ]);
     }
 
-    // Notify friends
     friendIds.forEach((fid) => {
       req.io.to(fid).emit('friend_removed', { removedUserId: userId });
     });
@@ -390,13 +458,11 @@ exports.deleteUser = async (req, res) => {
 exports.getFriends = async (req, res) => {
   try {
     const userId = req.userId;
-
     const user = await User.findById(userId)
       .populate('friends', 'user_name gender bio profilePicture lastSeen');
     if (!user) {
       return res.status(404).json({ message: 'User not found.' });
     }
-
     return res.status(200).json({ friends: user.friends });
   } catch (err) {
     logger.error('Error in getFriends', { error: err.message });
@@ -409,7 +475,6 @@ exports.getFriends = async (req, res) => {
 exports.getPendingFriendRequests = async (req, res) => {
   try {
     const userId = req.userId;
-
     const user = await User.findById(userId)
       .populate('friendRequests.fromUserId', 'user_name gender profilePicture');
     if (!user) {
