@@ -88,3 +88,6 @@ temp/
 
 # Local build
 build/
+
+# User uploaded files
+uploads/

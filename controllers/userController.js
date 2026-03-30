@@ -1,549 +1,464 @@
+const { Expo } = require('expo-server-sdk');
 const User = require('../models/User');
 const Chat = require('../models/Chat');
 const { activeRooms, randomChatMessages } = require('../utils/activeRooms');
+const logger = require('../utils/logger');
+const { sendPushToUser, templates } = require('../utils/pushNotifications');
 
-const log = (message, data) => {
-  console.log(`[${new Date().toISOString()}] UserController: ${message}`, data || '');
-};
+const OBJECT_ID_RE = /^[0-9a-fA-F]{24}$/;
 
-// Create or update user (unchanged, included for completeness)
-exports.createUser = async (req, res) => {
-  log('Received createUser request', { body: req.body });
+// ─── Update Push Token ────────────────────────────────────────────────────────
+
+/**
+ * PUT /api/users/push-token
+ * Registers or clears the Expo push token for the authenticated user.
+ * Body: { token: string | null }
+ */
+exports.updatePushToken = async (req, res) => {
   try {
-    const { user_name, gender, bio, interests, userId } = req.body;
+    const userId = req.userId;
+    const { token } = req.body;
 
-    if (!user_name || !gender) {
-      log('Validation failed: Missing required fields', { user_name, gender });
-      return res.status(400).json({ message: 'Username and gender are required.' });
+    // Allow null/empty to clear the token (e.g. user revokes notification permission)
+    if (token !== null && token !== undefined && token !== '') {
+      if (!Expo.isExpoPushToken(token)) {
+        return res.status(400).json({ message: 'Invalid Expo push token format.' });
+      }
     }
 
-    if (!['Male', 'Female', 'Unknown'].includes(gender)) {
-      log('Validation failed: Invalid gender', { gender });
-      return res.status(400).json({ message: 'Invalid gender.' });
-    }
-
-    let user;
-    if (userId && /^[0-9a-fA-F]{24}$/.test(userId)) {
-      log('Updating existing user', { userId });
-      user = await User.findById(userId);
-      if (!user) {
-        log('User not found', { userId });
-        return res.status(404).json({ message: 'User not found.' });
-      }
-
-      const existingUser = await User.findOne({ user_name, _id: { $ne: userId } });
-      if (existingUser) {
-        log('Username already in use', { user_name });
-        return res.status(400).json({ message: 'Username already in use.' });
-      }
-
-      user.user_name = user_name;
-      user.gender = gender;
-      user.bio = bio || '';
-      user.interests = interests || [];
-    } else {
-      log('Creating new user', { user_name });
-      const existingUser = await User.findOne({ user_name });
-      if (existingUser) {
-        log('Username already in use', { user_name });
-        return res.status(400).json({ message: 'Username already in use.' });
-      }
-
-      user = new User({
-        user_name,
-        gender,
-        bio: bio || '',
-        interests: interests || [],
-        friends: [],
-        friendRequests: [],
-      });
-    }
-
-    await user.save();
-    log('User saved successfully', { userId: user._id, user_name });
-
-    res.status(201).json({
-      message: userId ? 'User updated' : 'User created',
-      user: {
-        _id: user._id,
-        user_name: user.user_name,
-        gender: user.gender,
-        bio: user.bio,
-        interests: user.interests,
-        friends: user.friends,
-      },
+    await User.findByIdAndUpdate(userId, {
+      expoPushToken: token || null,
     });
+
+    logger.info('Push token updated', { userId, hasToken: !!token });
+    return res.status(200).json({ message: token ? 'Push token registered.' : 'Push token cleared.' });
   } catch (err) {
-    log('Error in createUser', { error: err.message });
-    res.status(500).json({ message: err.message });
+    logger.error('Error in updatePushToken', { error: err.message });
+    return res.status(500).json({ message: 'Internal server error.' });
   }
 };
 
-// Update user (unchanged, included for completeness)
+// ─── Update User ─────────────────────────────────────────────────────────────
+
 exports.updateUser = async (req, res) => {
-  log('Received updateUser request', { body: req.body });
   try {
-    const { user_name, gender, bio, interests, userId } = req.body;
+    const userId = req.userId; // set by auth middleware
+    const { user_name, gender, bio, interests } = req.body;
 
-    if (!userId || !/^[0-9a-fA-F]{24}$/.test(userId)) {
-      log('Validation failed: Invalid userId', { userId });
-      return res.status(400).json({ message: 'Invalid userId.' });
+    if (!user_name || typeof user_name !== 'string' || user_name.trim().length < 2) {
+      return res.status(400).json({ message: 'Username must be at least 2 characters.' });
     }
-
-    if (!user_name || !gender) {
-      log('Validation failed: Missing required fields', { user_name, gender });
-      return res.status(400).json({ message: 'Username and gender are required.' });
+    if (user_name.trim().length > 30) {
+      return res.status(400).json({ message: 'Username must not exceed 30 characters.' });
     }
-
-    if (!['Male', 'Female', 'Unknown'].includes(gender)) {
-      log('Validation failed: Invalid gender', { gender });
-      return res.status(400).json({ message: 'Invalid gender.' });
+    if (!gender || !['Male', 'Female', 'Unknown'].includes(gender)) {
+      return res.status(400).json({ message: 'Gender must be Male, Female, or Unknown.' });
     }
 
     const user = await User.findById(userId);
     if (!user) {
-      log('User not found', { userId });
       return res.status(404).json({ message: 'User not found.' });
     }
 
-    const existingUser = await User.findOne({ user_name, _id: { $ne: userId } });
-    if (existingUser) {
-      log('Username already in use', { user_name });
-      return res.status(400).json({ message: 'Username already in use.' });
+    const nameConflict = await User.findOne({ user_name: user_name.trim(), _id: { $ne: userId } });
+    if (nameConflict) {
+      return res.status(409).json({ message: 'Username already taken.' });
     }
 
     user.user_name = user_name.trim();
     user.gender = gender;
-    user.bio = bio ? bio.trim() : '';
-    user.interests = interests || [];
+    user.bio = bio ? String(bio).trim().slice(0, 300) : '';
+    user.interests = Array.isArray(interests)
+      ? interests.map((i) => String(i).trim()).slice(0, 20)
+      : [];
 
     await user.save();
-    log('User updated successfully', { userId, user_name });
+    logger.info('User updated', { userId });
 
-    res.status(200).json({
-      message: 'User updated successfully.',
+    return res.status(200).json({
+      message: 'Profile updated successfully.',
       user: {
         _id: user._id,
         user_name: user.user_name,
         gender: user.gender,
         bio: user.bio,
         interests: user.interests,
-        friends: user.friends,
       },
     });
   } catch (err) {
-    log('Error in updateUser', { error: err.message });
-    res.status(500).json({ message: err.message });
+    logger.error('Error in updateUser', { error: err.message });
+    return res.status(500).json({ message: 'Internal server error.' });
   }
 };
 
-// Send friend request (unchanged)
-exports.sendFriendRequest = async (req, res) => {
-  log('Received sendFriendRequest request', { body: req.body });
-  try {
-    const { userId, friendId } = req.body;
+// ─── Upload Profile Picture ───────────────────────────────────────────────────
 
-    if (!userId || !friendId || !/^[0-9a-fA-F]{24}$/.test(userId) || !/^[0-9a-fA-F]{24}$/.test(friendId)) {
-      log('Validation failed: Invalid userId or friendId', { userId, friendId });
-      return res.status(400).json({ message: 'Invalid userId or friendId.' });
+exports.uploadProfilePicture = async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ message: 'No image file uploaded.' });
+    }
+
+    const userId = req.userId;
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found.' });
+    }
+
+    const relativePath = `/uploads/${req.file.filename}`;
+    user.profilePicture = relativePath;
+    await user.save();
+
+    logger.info('Profile picture updated', { userId });
+    return res.status(200).json({ message: 'Profile picture updated.', profilePicture: relativePath });
+  } catch (err) {
+    logger.error('Error in uploadProfilePicture', { error: err.message });
+    return res.status(500).json({ message: 'Internal server error.' });
+  }
+};
+
+// ─── Send Friend Request ──────────────────────────────────────────────────────
+
+exports.sendFriendRequest = async (req, res) => {
+  try {
+    const userId = req.userId;
+    const { friendId } = req.body;
+
+    if (!friendId || !OBJECT_ID_RE.test(friendId)) {
+      return res.status(400).json({ message: 'Invalid friendId.' });
     }
     if (userId === friendId) {
-      log('Validation failed: Cannot send friend request to self', { userId });
-      return res.status(400).json({ message: 'Cannot send friend request to self.' });
+      return res.status(400).json({ message: 'Cannot send friend request to yourself.' });
     }
 
-    const user = await User.findById(userId);
-    const friend = await User.findById(friendId);
+    const [user, friend] = await Promise.all([
+      User.findById(userId),
+      User.findById(friendId),
+    ]);
 
     if (!user || !friend) {
-      log('User or friend not found', { userId, friendId });
-      return res.status(404).json({ message: 'User or friend not found.' });
+      return res.status(404).json({ message: 'User not found.' });
     }
-
-    if (user.friends.includes(friendId)) {
-      log('Already friends', { userId, friendId });
+    if (user.friends.some((id) => id.toString() === friendId)) {
       return res.status(400).json({ message: 'Already friends.' });
     }
-
-    if (friend.friendRequests.some((req) => req.fromUserId.toString() === userId && req.status === 'pending')) {
-      log('Friend request already sent', { userId, friendId });
+    if (friend.friendRequests.some((r) => r.fromUserId.toString() === userId && r.status === 'pending')) {
       return res.status(400).json({ message: 'Friend request already sent.' });
     }
 
-    friend.friendRequests.push({
-      fromUserId: userId,
-      status: 'pending',
-    });
-
+    friend.friendRequests.push({ fromUserId: userId, status: 'pending' });
     await friend.save();
-    log('Friend request saved', { fromUserId: userId, toUserId: friendId });
 
     req.io.to(friendId).emit('friend_request_received', {
       fromUserId: userId,
       fromUsername: user.user_name,
     });
-    req.io.in(friendId).allSockets().then((sockets) => {
-      log('Emitted friend_request_received', {
-        toUserId: friendId,
-        fromUsername: user.user_name,
-        socketIds: [...sockets],
-      });
-    });
 
     const room = activeRooms.get(userId);
     if (room && room.type === 'random' && room.partnerId === friendId) {
-      req.io.to(userId).emit('friend_request_sent', {
-        toUserId: friendId,
+      req.io.to(room.roomId).emit('friend_request_status', {
         fromUserId: userId,
-        fromUsername: user.user_name,
-      });
-      req.io.to(friendId).emit('friend_request_sent', {
         toUserId: friendId,
-        fromUserId: userId,
         fromUsername: user.user_name,
+        status: 'sent',
       });
-      log('Emitted friend_request_sent to both users', { userId, friendId });
     }
 
-    res.status(200).json({ message: 'Friend request sent.' });
+    // Push notification — fire-and-forget, do not await to avoid blocking response
+    sendPushToUser(
+      friendId,
+      templates.friendRequest(user.user_name, userId),
+      User
+    ).catch((err) => logger.error('Push failed for friendRequest', { error: err.message }));
+
+    logger.info('Friend request sent', { fromUserId: userId, toUserId: friendId });
+    return res.status(200).json({ message: 'Friend request sent.' });
   } catch (err) {
-    log('Error in sendFriendRequest', { error: err.message });
-    res.status(500).json({ message: err.message });
+    logger.error('Error in sendFriendRequest', { error: err.message });
+    return res.status(500).json({ message: 'Internal server error.' });
   }
 };
 
-// Accept friend request (unchanged)
-exports.acceptFriendRequest = async (req, res) => {
-  log('Received acceptFriendRequest request', { body: req.body });
-  try {
-    const { userId, friendId } = req.body;
+// ─── Accept Friend Request ────────────────────────────────────────────────────
 
-    if (!userId || !friendId || !/^[0-9a-fA-F]{24}$/.test(userId) || !/^[0-9a-fA-F]{24}$/.test(friendId)) {
-      log('Validation failed: Invalid userId or friendId', { userId, friendId });
-      return res.status(400).json({ message: 'Invalid userId or friendId.' });
+exports.acceptFriendRequest = async (req, res) => {
+  try {
+    const userId = req.userId;
+    const { friendId } = req.body;
+
+    if (!friendId || !OBJECT_ID_RE.test(friendId)) {
+      return res.status(400).json({ message: 'Invalid friendId.' });
     }
 
-    const user = await User.findById(userId);
-    const friend = await User.findById(friendId);
+    const [user, friend] = await Promise.all([
+      User.findById(userId),
+      User.findById(friendId),
+    ]);
 
     if (!user || !friend) {
-      log('User or friend not found', { userId, friendId });
-      return res.status(404).json({ message: 'User or friend not found.' });
+      return res.status(404).json({ message: 'User not found.' });
     }
-
-    if (user.friends.includes(friendId)) {
-      log('Already friends', { userId, friendId });
+    if (user.friends.some((id) => id.toString() === friendId)) {
       return res.status(400).json({ message: 'Already friends.' });
     }
 
-    const request = user.friendRequests.find((req) => req.fromUserId.toString() === friendId);
+    const request = user.friendRequests.find((r) => r.fromUserId.toString() === friendId);
     if (!request || request.status !== 'pending') {
-      log('No pending friend request', { userId, friendId });
-      return res.status(400).json({ message: 'No pending friend request.' });
+      return res.status(400).json({ message: 'No pending friend request from this user.' });
     }
 
     user.friends.push(friendId);
     friend.friends.push(userId);
-    user.friendRequests = user.friendRequests.filter((req) => req.fromUserId.toString() !== friendId);
+    user.friendRequests = user.friendRequests.filter((r) => r.fromUserId.toString() !== friendId);
 
-    await user.save();
-    await friend.save();
-    log('Friendship established', { userId, friendId });
+    await Promise.all([user.save(), friend.save()]);
 
+    // Persist any random chat messages into permanent chat history
     const roomId = [userId, friendId].sort().join('-');
     const messages = randomChatMessages.get(roomId) || [];
     if (messages.length > 0) {
-      log('Persisting random chat messages', { roomId, messageCount: messages.length });
       let chat = await Chat.findOne({ participants: { $all: [userId, friendId] } });
       if (!chat) {
-        chat = new Chat({
-          participants: [userId, friendId],
-          messages: [],
-        });
+        chat = new Chat({ participants: [userId, friendId], messages: [] });
       }
       chat.messages.push(...messages);
       await chat.save();
       randomChatMessages.delete(roomId);
-      log('Messages persisted and cleared', { roomId });
     }
 
     activeRooms.delete(userId);
     activeRooms.delete(friendId);
-    log('Cleared active rooms', { userId, friendId });
 
-    req.io.to(userId).emit('friend_request_accepted', {
-      userId,
+    req.io.to(userId).emit('friend_request_accepted', { userId, friendId, friendUsername: friend.user_name });
+    req.io.to(friendId).emit('friend_request_accepted', { userId: friendId, friendId: userId, friendUsername: user.user_name });
+    req.io.to(userId).emit('friend_added', { friendId, friendUsername: friend.user_name });
+    req.io.to(friendId).emit('friend_added', { friendId: userId, friendUsername: user.user_name });
+
+    // Push notification to the original requester (friendId sent the request, userId accepted it)
+    sendPushToUser(
       friendId,
-      friendUsername: friend.user_name,
-    });
-    req.io.to(friendId).emit('friend_request_accepted', {
-      userId: friendId,
-      friendId: userId,
-      friendUsername: user.user_name,
-    });
-    log('Emitted friend_request_accepted', { userId, friendId });
+      templates.friendAccepted(user.user_name, userId),
+      User
+    ).catch((err) => logger.error('Push failed for friendAccepted', { error: err.message }));
 
-    req.io.to(userId).emit('friend_added', {
-      friendId,
-      friendUsername: friend.user_name,
-    });
-    req.io.to(friendId).emit('friend_added', {
-      friendId: userId,
-      friendUsername: user.user_name,
-    });
-    log('Emitted friend_added', { userId, friendId });
-
-    res.status(200).json({ message: 'Friend request accepted.' });
+    logger.info('Friend request accepted', { userId, friendId });
+    return res.status(200).json({ message: 'Friend request accepted.' });
   } catch (err) {
-    log('Error in acceptFriendRequest', { error: err.message });
-    res.status(500).json({ message: err.message });
+    logger.error('Error in acceptFriendRequest', { error: err.message });
+    return res.status(500).json({ message: 'Internal server error.' });
   }
 };
 
-// Reject friend request (updated)
+// ─── Reject Friend Request ────────────────────────────────────────────────────
+
 exports.rejectFriendRequest = async (req, res) => {
-  log('Received rejectFriendRequest request', { body: req.body });
   try {
-    const { userId, friendId } = req.body;
+    const userId = req.userId;
+    const { friendId } = req.body;
 
-    if (!userId || !friendId || !/^[0-9a-fA-F]{24}$/.test(userId) || !/^[0-9a-fA-F]{24}$/.test(friendId)) {
-      log('Validation failed: Invalid userId or friendId', { userId, friendId });
-      return res.status(400).json({ message: 'Invalid userId or friendId.' });
+    if (!friendId || !OBJECT_ID_RE.test(friendId)) {
+      return res.status(400).json({ message: 'Invalid friendId.' });
     }
 
-    const user = await User.findById(userId);
-    const friend = await User.findById(friendId);
+    const [user, friend] = await Promise.all([
+      User.findById(userId),
+      User.findById(friendId),
+    ]);
+
     if (!user || !friend) {
-      log('User or friend not found', { userId, friendId });
-      return res.status(404).json({ message: 'User or friend not found.' });
+      return res.status(404).json({ message: 'User not found.' });
     }
 
-    if (!user.friendRequests.some((req) => req.fromUserId.toString() === friendId)) {
-      log('No pending friend request', { userId, friendId });
-      return res.status(400).json({ message: 'No pending friend request.' });
+    const hasPending = user.friendRequests.some((r) => r.fromUserId.toString() === friendId);
+    if (!hasPending) {
+      return res.status(400).json({ message: 'No pending friend request from this user.' });
     }
 
-    // Remove the friend request from the recipient's friendRequests
-    user.friendRequests = user.friendRequests.filter((req) => req.fromUserId.toString() !== friendId);
-
-    // Remove any pending friend request from the sender to the recipient
-    friend.friendRequests = friend.friendRequests.filter((req) => req.fromUserId.toString() !== userId);
-
-    await user.save();
-    await friend.save();
-    log('Friend request rejected and cleared for both users', { userId, friendId });
+    user.friendRequests = user.friendRequests.filter((r) => r.fromUserId.toString() !== friendId);
+    friend.friendRequests = friend.friendRequests.filter((r) => r.fromUserId.toString() !== userId);
+    await Promise.all([user.save(), friend.save()]);
 
     const room = activeRooms.get(userId);
     if (room && room.type === 'random' && room.partnerId === friendId) {
-      req.io.to(userId).emit('friend_request_rejected', { fromUserId: friendId, toUserId: userId });
-      req.io.to(friendId).emit('friend_request_rejected', { fromUserId: friendId, toUserId: userId });
-      log('Emitted friend_request_rejected to both users', { userId, friendId });
+      req.io.to(room.roomId).emit('friend_request_status', {
+        fromUserId: friendId,
+        toUserId: userId,
+        status: 'rejected',
+      });
     }
 
-    res.status(200).json({ message: 'Friend request rejected.' });
+    logger.info('Friend request rejected', { userId, friendId });
+    return res.status(200).json({ message: 'Friend request rejected.' });
   } catch (err) {
-    log('Error in rejectFriendRequest', { error: err.message });
-    res.status(500).json({ message: err.message });
+    logger.error('Error in rejectFriendRequest', { error: err.message });
+    return res.status(500).json({ message: 'Internal server error.' });
   }
 };
 
-// Remove friend (unchanged)
-exports.removeFriend = async (req, res) => {
-  log('Received removeFriend request', { params: req.params });
-  try {
-    const { userId, friendId } = req.params;
+// ─── Remove Friend ────────────────────────────────────────────────────────────
 
-    if (!userId || !friendId || !/^[0-9a-fA-F]{24}$/.test(userId) || !/^[0-9a-fA-F]{24}$/.test(friendId)) {
-      log('Validation failed: Invalid userId or friendId', { userId, friendId });
-      return res.status(400).json({ message: 'Invalid userId or friendId.' });
+exports.removeFriend = async (req, res) => {
+  try {
+    const userId = req.userId;
+    const { friendId } = req.params;
+
+    if (!friendId || !OBJECT_ID_RE.test(friendId)) {
+      return res.status(400).json({ message: 'Invalid friendId.' });
     }
 
-    const user = await User.findById(userId);
-    const friend = await User.findById(friendId);
+    const [user, friend] = await Promise.all([
+      User.findById(userId),
+      User.findById(friendId),
+    ]);
 
     if (!user || !friend) {
-      log('User or friend not found', { userId, friendId });
-      return res.status(404).json({ message: 'User or friend not found.' });
+      return res.status(404).json({ message: 'User not found.' });
     }
-
-    if (!user.friends.includes(friendId)) {
-      log('Not friends with this user', { userId, friendId });
+    if (!user.friends.some((id) => id.toString() === friendId)) {
       return res.status(400).json({ message: 'Not friends with this user.' });
     }
 
     user.friends = user.friends.filter((id) => id.toString() !== friendId);
     friend.friends = friend.friends.filter((id) => id.toString() !== userId);
 
-    await Chat.deleteOne({
-      participants: { $all: [userId, friendId] },
-    });
-    log('Chat collection deleted', { userId, friendId });
-
-    await user.save();
-    await friend.save();
-    log('Friendship removed', { userId, friendId });
+    await Promise.all([
+      user.save(),
+      friend.save(),
+      Chat.deleteOne({ participants: { $all: [userId, friendId] } }),
+    ]);
 
     req.io.to(userId).emit('friend_removed', { removedUserId: friendId });
     req.io.to(friendId).emit('friend_removed', { removedUserId: userId });
-    log('Emitted friend_removed', { userId, friendId });
 
-    res.status(200).json({ message: 'Friend removed successfully.' });
+    logger.info('Friend removed', { userId, friendId });
+    return res.status(200).json({ message: 'Friend removed successfully.' });
   } catch (err) {
-    log('Error in removeFriend', { error: err.message });
-    res.status(500).json({ message: err.message });
+    logger.error('Error in removeFriend', { error: err.message });
+    return res.status(500).json({ message: 'Internal server error.' });
   }
 };
 
-// Delete user (unchanged)
+// ─── Delete Account ───────────────────────────────────────────────────────────
+
 exports.deleteUser = async (req, res) => {
-  log('Received deleteUser request', { body: req.body });
   try {
-    const { userId } = req.body;
+    const userId = req.userId;
 
-    if (!userId || !/^[0-9a-fA-F]{24}$/.test(userId)) {
-      log('Validation failed: Invalid userId', { userId });
-      return res.status(400).json({ message: 'Invalid userId.' });
-    }
-
-    log('Attempting to find user', { userId });
     const user = await User.findById(userId);
     if (!user) {
-      log('User not found or already deleted', { userId });
-      return res.status(200).json({ message: 'User already deleted or not found.' });
+      return res.status(404).json({ message: 'User not found.' });
     }
 
-    log('Removing user from friends lists', { userId });
-    await User.updateMany(
-      { friends: userId },
-      { $pull: { friends: userId } }
-    );
+    const friendIds = user.friends.map((id) => id.toString());
 
-    log('Clearing friend requests', { userId });
-    await User.updateMany(
-      { 'friendRequests.fromUserId': userId },
-      { $pull: { friendRequests: { fromUserId: userId } } }
-    );
-    await User.updateMany(
-      { _id: userId },
-      { $set: { friendRequests: [] } }
-    );
+    await Promise.all([
+      User.updateMany({ friends: userId }, { $pull: { friends: userId } }),
+      User.updateMany(
+        { 'friendRequests.fromUserId': userId },
+        { $pull: { friendRequests: { fromUserId: userId } } }
+      ),
+      Chat.deleteMany({ participants: userId }),
+    ]);
 
-    log('Deleting user chats', { userId });
-    await Chat.deleteMany({
-      participants: userId,
-    });
-
-    log('Clearing socket states', { userId });
+    // Clean up in-memory state
     activeRooms.delete(userId);
-    for (const [roomId, room] of activeRooms) {
+    for (const [key, room] of activeRooms) {
       if (room.partnerId === userId) {
-        activeRooms.delete(roomId);
-        randomChatMessages.delete(roomId);
+        randomChatMessages.delete(room.roomId); // Fix: use room.roomId, not key
+        activeRooms.delete(key);
       }
     }
 
-    log('Notifying friends of removal', { userId });
-    user.friends.forEach((friendId) => {
-      req.io.to(friendId.toString()).emit('friend_removed', { removedUserId: userId });
+    // Notify friends
+    friendIds.forEach((fid) => {
+      req.io.to(fid).emit('friend_removed', { removedUserId: userId });
     });
-
-    log('Deleting user from database', { userId });
-    await User.findByIdAndDelete(userId);
-
-    log('Emitting user_deleted event', { userId });
     req.io.to(userId).emit('user_deleted', { userId });
 
-    log('User deleted and event emitted', { userId });
-    return res.status(200).json({ message: 'User deleted successfully.' });
+    await User.findByIdAndDelete(userId);
+
+    logger.info('User account deleted', { userId });
+    return res.status(200).json({ message: 'Account deleted successfully.' });
   } catch (err) {
-    log('Error in deleteUser', { error: err.message, stack: err.stack });
-    return res.status(500).json({ message: 'Failed to delete user.', error: err.message });
+    logger.error('Error in deleteUser', { error: err.message });
+    return res.status(500).json({ message: 'Internal server error.' });
   }
 };
 
-// Get friends (unchanged)
+// ─── Get Friends ──────────────────────────────────────────────────────────────
+
 exports.getFriends = async (req, res) => {
-  log('Received getFriends request', { params: req.params });
   try {
-    const { userId } = req.params;
+    const userId = req.userId;
 
-    if (!userId || !/^[0-9a-fA-F]{24}$/.test(userId)) {
-      log('Validation failed: Invalid userId', { userId });
-      return res.status(400).json({ message: 'Invalid userId.' });
-    }
-
-    const user = await User.findById(userId).populate('friends', 'user_name');
+    const user = await User.findById(userId)
+      .populate('friends', 'user_name gender bio profilePicture lastSeen');
     if (!user) {
-      log('User not found', { userId });
       return res.status(404).json({ message: 'User not found.' });
     }
 
-    log('Friends retrieved', { userId, friendCount: user.friends.length });
-    res.status(200).json({ friends: user.friends });
+    return res.status(200).json({ friends: user.friends });
   } catch (err) {
-    log('Error in getFriends', { error: err.message });
-    res.status(500).json({ message: err.message });
+    logger.error('Error in getFriends', { error: err.message });
+    return res.status(500).json({ message: 'Internal server error.' });
   }
 };
 
-// Get pending friend requests (unchanged)
+// ─── Get Pending Friend Requests ──────────────────────────────────────────────
+
 exports.getPendingFriendRequests = async (req, res) => {
-  log('Received getPendingFriendRequests request', { params: req.params });
   try {
-    const { userId } = req.params;
+    const userId = req.userId;
 
-    if (!userId || !/^[0-9a-fA-F]{24}$/.test(userId)) {
-      log('Validation failed: Invalid userId', { userId });
-      return res.status(400).json({ message: 'Invalid userId.' });
-    }
-
-    const user = await User.findById(userId).populate('friendRequests.fromUserId', 'user_name');
+    const user = await User.findById(userId)
+      .populate('friendRequests.fromUserId', 'user_name gender profilePicture');
     if (!user) {
-      log('User not found', { userId });
       return res.status(404).json({ message: 'User not found.' });
     }
 
-    const pendingRequests = user.friendRequests
-      .filter((req) => req.status === 'pending')
-      .map((req) => ({
-        fromUserId: req.fromUserId._id.toString(),
-        fromUsername: req.fromUserId.user_name || 'Anonymous',
+    const pending = user.friendRequests
+      .filter((r) => r.status === 'pending')
+      .map((r) => ({
+        fromUserId: r.fromUserId._id.toString(),
+        fromUsername: r.fromUserId.user_name || 'Anonymous',
+        gender: r.fromUserId.gender,
+        profilePicture: r.fromUserId.profilePicture,
       }));
 
-    log('Pending friend requests retrieved', { userId, requestCount: pendingRequests.length });
-    res.status(200).json({ friendRequests: pendingRequests });
+    return res.status(200).json({ friendRequests: pending });
   } catch (err) {
-    log('Error in getPendingFriendRequests', { error: err.message });
-    res.status(500).json({ message: err.message });
+    logger.error('Error in getPendingFriendRequests', { error: err.message });
+    return res.status(500).json({ message: 'Internal server error.' });
   }
 };
 
-// Get user by ID (unchanged)
+// ─── Get User By ID (public) ──────────────────────────────────────────────────
+
 exports.getUserById = async (req, res) => {
-  log('Received getUserById request', { params: req.params });
   try {
     const { userId } = req.params;
 
-    if (!userId || !/^[0-9a-fA-F]{24}$/.test(userId)) {
-      log('Validation failed: Invalid userId', { userId });
+    if (!userId || !OBJECT_ID_RE.test(userId)) {
       return res.status(400).json({ message: 'Invalid userId.' });
     }
 
-    const user = await User.findById(userId).select('user_name gender bio interests -_id');
+    const user = await User.findById(userId)
+      .select('user_name gender bio interests profilePicture lastSeen');
     if (!user) {
-      log('User not found', { userId });
       return res.status(404).json({ message: 'User not found.' });
     }
 
-    log('User retrieved', { userId });
-    res.status(200).json({
+    return res.status(200).json({
+      _id: user._id,
       user_name: user.user_name,
       gender: user.gender,
       bio: user.bio,
       interests: user.interests,
+      profilePicture: user.profilePicture,
+      lastSeen: user.lastSeen,
     });
   } catch (err) {
-    log('Error in getUserById', { error: err.message });
-    res.status(500).json({ message: err.message });
+    logger.error('Error in getUserById', { error: err.message });
+    return res.status(500).json({ message: 'Internal server error.' });
   }
 };

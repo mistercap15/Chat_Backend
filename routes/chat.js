@@ -1,20 +1,15 @@
 const express = require('express');
 const router = express.Router();
 const chatController = require('../controllers/chatController');
+const { authenticate } = require('../middlewares/auth');
+const { messageLimiter } = require('../middlewares/rateLimit');
 
-const log = (message, data) => {
-  console.log(`[${new Date().toISOString()}] ChatRoutes: ${message}`, data || '');
-};
+// All chat endpoints require authentication
+router.use(authenticate);
 
-// Log incoming requests
-router.use((req, res, next) => {
-  log(`${req.method} ${req.path}`, { body: req.body, params: req.params });
-  next();
-});
-
-router.post('/send', chatController.sendMessage);
-router.post('/send-random', chatController.sendRandomMessage);
-router.get('/:userId/:friendId', chatController.getChatHistory);
+router.post('/send', messageLimiter, chatController.sendMessage);
+router.post('/send-random', messageLimiter, chatController.sendRandomMessage);
+router.get('/:friendId', chatController.getChatHistory);
 router.post('/seen', chatController.markMessageSeen);
 
 module.exports = router;
